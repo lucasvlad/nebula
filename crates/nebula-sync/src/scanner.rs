@@ -16,6 +16,8 @@ use nebula_core::chunker::{RollingChunker, chunk_all};
 use nebula_core::manifest::{FileEntry, missing_chunks};
 use nebula_core::path::{PathError, RelPath, case_collisions};
 
+use tracing::{debug, info, warn};
+
 use crate::store::{Folder, Store, StoreError};
 
 /// Prefix for Nebula's own in-progress downloads, which are never synced.
@@ -37,17 +39,31 @@ pub enum ScanError {
 
 #[derive(Debug, Default)]
 pub struct ScanReport {
-    pub added: Vec<RelPath>,
+    pub added: Vec<Added>,
     pub modified: Vec<Modified>,
     pub deleted: Vec<RelPath>,
+    /// Files whose content is the same as at the last scan.
     pub unchanged: usize,
+    /// How many of the unchanged files were trusted from size and mtime
+    /// alone, without reading them.
+    pub trusted: usize,
     pub skipped: Vec<Skipped>,
+    /// Files read and chunked this scan, and their total size.
+    pub read_files: usize,
+    pub read_bytes: u64,
 }
 
 impl ScanReport {
     pub fn has_changes(&self) -> bool {
         !(self.added.is_empty() && self.modified.is_empty() && self.deleted.is_empty())
     }
+}
+
+#[derive(Debug)]
+pub struct Added {
+    pub path: RelPath,
+    pub size: u64,
+    pub chunks: usize,
 }
 
 /// A changed file, with how much of it would actually need to be sent.
@@ -71,7 +87,7 @@ pub struct Skipped {
 pub enum SkipReason {
     #[error("name is not valid UTF-8")]
     NotUtf8,
-    #[error("name cannot sync to every platform: {0}")]
+    #[error("{0}")]
     InvalidName(PathError),
     #[error("differs only in letter case from another path")]
     CaseCollision,
@@ -140,8 +156,19 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
         if let Some(old) = old {
             let trusted = found.mtime_ns < folder.last_scan_ns.saturating_sub(RACY_WINDOW_NS);
             if trusted && old.size == found.size && old.mtime_ns == found.mtime_ns {
+                debug!(
+                    "{}: same size and modification time as last scan, so not re-reading it",
+                    found.path
+                );
                 report.unchanged += 1;
+                report.trusted += 1;
                 continue;
+            }
+            if old.size == found.size && old.mtime_ns == found.mtime_ns {
+                debug!(
+                    "{}: looks unchanged, but was modified close to the last scan, so reading it to be sure",
+                    found.path
+                );
             }
         }
 
@@ -149,6 +176,7 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
             match File::open(&found.abs).and_then(|f| chunk_all(f, RollingChunker::default())) {
                 Ok(c) => c,
                 Err(e) => {
+                    warn!("{}: could not read it ({e}), skipping", found.path);
                     report
                         .skipped
                         .push(skip(&folder.root, &found.abs, SkipReason::Unreadable(e)));
@@ -159,6 +187,10 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
         match fs::symlink_metadata(&found.abs) {
             Ok(m) if m.len() == found.size && mtime_ns(&m) == found.mtime_ns => {}
             _ => {
+                debug!(
+                    "{}: changed while being read, will retry next scan",
+                    found.path
+                );
                 report
                     .skipped
                     .push(skip(&folder.root, &found.abs, SkipReason::Changing));
@@ -166,6 +198,14 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
             }
         }
 
+        report.read_files += 1;
+        report.read_bytes += chunked.size;
+        debug!(
+            "{}: read {} bytes and split them into {} chunks",
+            found.path,
+            chunked.size,
+            chunked.chunks.len()
+        );
         let mut entry = FileEntry {
             path: found.path.clone(),
             size: chunked.size,
@@ -179,6 +219,10 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
         match old {
             Some(old) if old.content_hash == entry.content_hash => {
                 // Touched but not edited: refresh the stat info, keep the version.
+                debug!(
+                    "{}: content identical to last scan, version unchanged",
+                    entry.path
+                );
                 report.unchanged += 1;
                 if old.mtime_ns != entry.mtime_ns {
                     entry.version = old.version.clone();
@@ -197,6 +241,11 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
                 });
                 entry.version = old.version.clone();
                 entry.version.increment(device);
+                info!(
+                    "{}: changed, so this device's edit count goes up to {}",
+                    entry.path,
+                    entry.version.get(&device)
+                );
                 changed.push(entry);
             }
             None => {
@@ -205,7 +254,19 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
                     entry.version = tomb.version.clone();
                 }
                 entry.version.increment(device);
-                report.added.push(entry.path.clone());
+                if known.contains_key(&found.path) {
+                    info!(
+                        "{}: recreated after being deleted, continuing its version history",
+                        entry.path
+                    );
+                } else {
+                    info!("{}: new file, starting its version history", entry.path);
+                }
+                report.added.push(Added {
+                    path: entry.path.clone(),
+                    size: entry.size,
+                    chunks: entry.chunks.len(),
+                });
                 changed.push(entry);
             }
         }
@@ -216,16 +277,23 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
             .blind_dirs
             .iter()
             .any(|d| path.as_str().starts_with(&format!("{d}/")));
-        if entry.deleted || seen.contains(path) || under_blind_dir {
+        if entry.deleted || seen.contains(path) {
             continue;
         }
+        if under_blind_dir {
+            debug!(
+                "{path}: missing, but its folder could not be read, so not treating it as deleted"
+            );
+            continue;
+        }
+        info!("{path}: deleted, recording a tombstone so other devices delete it too");
         let mut tomb = entry.clone();
         tomb.mark_deleted(device);
         report.deleted.push(path.clone());
         changed.push(tomb);
     }
 
-    report.added.sort();
+    report.added.sort_by(|a, b| a.path.cmp(&b.path));
     report.modified.sort_by(|a, b| a.path.cmp(&b.path));
     report.deleted.sort();
     store.save_scan(folder.id, &changed, started_ns)?;
@@ -401,13 +469,18 @@ mod tests {
         v.iter().map(RelPath::as_str).collect()
     }
 
+    fn added(r: &ScanReport) -> Vec<&str> {
+        r.added.iter().map(|a| a.path.as_str()).collect()
+    }
+
     #[test]
     fn first_scan_adds_everything() {
         let mut fx = Fixture::new();
         fx.write("a.txt", b"hello");
         fx.write("sub/dir/b.bin", &[7; 100_000]);
         let r = fx.scan();
-        assert_eq!(paths(&r.added), ["a.txt", "sub/dir/b.bin"]);
+        assert_eq!(added(&r), ["a.txt", "sub/dir/b.bin"]);
+        assert_eq!((r.read_files, r.read_bytes), (2, 100_005));
         let b = fx.entry("sub/dir/b.bin");
         assert_eq!(b.size, 100_000);
         assert_eq!(b.version.get(&DEV), 1);
@@ -426,6 +499,8 @@ mod tests {
         let r = fx.scan();
         assert!(!r.has_changes());
         assert_eq!(r.unchanged, 1);
+        // Scanned again right away, so it is re-read rather than trusted.
+        assert_eq!((r.trusted, r.read_files), (0, 1));
         assert_eq!(fx.entry("a.txt"), before);
     }
 
@@ -470,7 +545,7 @@ mod tests {
 
         fx.write("a.txt", b"back");
         let r = fx.scan();
-        assert_eq!(paths(&r.added), ["a.txt"]);
+        assert_eq!(added(&r), ["a.txt"]);
         let back = fx.entry("a.txt");
         assert!(!back.deleted);
         assert_eq!(back.version.compare(&tomb.version), Causality::After);
@@ -516,7 +591,7 @@ mod tests {
         set_mtime(&p, old);
         let r = fx.scan();
         assert!(!r.has_changes());
-        assert_eq!(r.unchanged, 1);
+        assert_eq!((r.unchanged, r.trusted, r.read_files), (1, 1, 0));
     }
 
     #[test]
@@ -528,7 +603,7 @@ mod tests {
         fx.write("~$report.docx", b"x");
         fx.write("real.txt", b"x");
         let r = fx.scan();
-        assert_eq!(paths(&r.added), ["real.txt"]);
+        assert_eq!(added(&r), ["real.txt"]);
         assert!(r.skipped.is_empty());
     }
 
@@ -540,7 +615,7 @@ mod tests {
         #[cfg(unix)]
         fx.write("a:b.txt", b"x");
         let r = fx.scan();
-        assert_eq!(paths(&r.added), ["ok.txt"]);
+        assert_eq!(added(&r), ["ok.txt"]);
         #[cfg(unix)]
         assert!(matches!(r.skipped[0].reason, SkipReason::InvalidName(_)));
     }
@@ -550,7 +625,7 @@ mod tests {
         let mut fx = Fixture::new();
         fx.write("e\u{301}.txt", b"x");
         let r = fx.scan();
-        assert_eq!(paths(&r.added), ["\u{e9}.txt"]);
+        assert_eq!(added(&r), ["\u{e9}.txt"]);
         // And the file is still found on the next scan, not deleted.
         assert!(!fx.scan().has_changes());
     }
@@ -576,7 +651,7 @@ mod tests {
         fx.write("real.txt", b"x");
         std::os::unix::fs::symlink("/etc/passwd", fx.dir.path().join("link")).unwrap();
         let r = fx.scan();
-        assert_eq!(paths(&r.added), ["real.txt"]);
+        assert_eq!(added(&r), ["real.txt"]);
         assert!(matches!(r.skipped[0].reason, SkipReason::Symlink));
     }
 
@@ -606,7 +681,7 @@ mod tests {
         fx.write("report.txt", b"2");
         fx.write("other.txt", b"3");
         let r = fx.scan();
-        assert_eq!(paths(&r.added), ["other.txt"]);
+        assert_eq!(added(&r), ["other.txt"]);
         assert_eq!(r.skipped.len(), 2);
     }
 }
