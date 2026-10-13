@@ -1,6 +1,7 @@
 //! The `nebula` command-line tool.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -15,6 +16,10 @@ struct Cli {
     /// Where Nebula keeps this device's key and state.
     #[arg(long, global = true, env = "NEBULA_HOME", value_name = "DIR")]
     home: Option<PathBuf>,
+
+    /// Explain what Nebula is doing (-v), or every decision it makes (-vv).
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     #[command(subcommand)]
     command: Command,
@@ -34,9 +39,6 @@ enum Command {
     Scan {
         /// Only this folder (default: all of them).
         folder: Option<PathBuf>,
-        /// List every changed file instead of the first few.
-        #[arg(short, long)]
-        verbose: bool,
     },
     /// Show what Nebula knows about the files in a synced folder.
     Ls { folder: PathBuf },
@@ -47,6 +49,7 @@ const LIST_LIMIT: usize = 10;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_logging(cli.verbose);
     let home = match cli.home {
         Some(home) => home,
         None => default_home()?,
@@ -83,7 +86,7 @@ fn main() -> Result<()> {
                 println!("{}{state}", f.root.display());
             }
         }
-        Command::Scan { folder, verbose } => {
+        Command::Scan { folder } => {
             let device = identity(&home)?.device_id();
             let mut store = open_store(&home)?;
             let folders = match folder {
@@ -94,33 +97,59 @@ fn main() -> Result<()> {
                 println!("No synced folders. Add one with `nebula add <folder>`.");
             }
             for f in folders {
+                println!("Scanning {}", tilde(&f.root));
+                let started = Instant::now();
                 let report = scanner::scan(&mut store, &f, device)
                     .with_context(|| format!("scanning {}", f.root.display()))?;
-                print_report(&f, &report, verbose);
+                print_report(&report, started.elapsed(), cli.verbose > 0);
             }
         }
         Command::Ls { folder } => {
             let store = open_store(&home)?;
             let f = find_folder(&store, &folder)?;
-            for e in store.files(f.id)? {
+            let device = identity(&home)?.device_id();
+            let files = store.files(f.id)?;
+            if files.is_empty() {
+                println!("Nothing recorded yet. Run `nebula scan` first.");
+                return Ok(());
+            }
+            println!(
+                "{:>10}  {:>6}  {:<8}  {:<16}  PATH",
+                "SIZE", "CHUNKS", "CONTENT", "VERSION"
+            );
+            for e in files {
                 let version: Vec<String> = e
                     .version
                     .iter()
                     .map(|(d, n)| format!("{}:{n}", d.short()))
                     .collect();
-                let state = if e.deleted {
-                    "deleted".to_string()
+                if e.deleted {
+                    println!(
+                        "{:>10}  {:>6}  {:<8}  {:<16}  {}",
+                        "deleted",
+                        "",
+                        "",
+                        version.join(" "),
+                        e.path
+                    );
                 } else {
-                    format!("{:>10}  {:>5} chunks", human_bytes(e.size), e.chunks.len())
-                };
-                println!(
-                    "{:<28}  {}  [{}]  {}",
-                    state,
-                    e.content_hash.short(),
-                    version.join(" "),
-                    e.path
-                );
+                    println!(
+                        "{:>10}  {:>6}  {:<8}  {:<16}  {}",
+                        human_bytes(e.size),
+                        e.chunks.len(),
+                        e.content_hash.short(),
+                        version.join(" "),
+                        e.path
+                    );
+                }
             }
+            println!();
+            println!(
+                "VERSION lists each device that changed a file and how many times \
+                 (this device is {}).",
+                device.short()
+            );
+            println!("CONTENT is the start of the file's BLAKE3 hash: same hash, same bytes.");
         }
     }
     Ok(())
@@ -183,34 +212,71 @@ fn find_folder(store: &Store, folder: &Path) -> Result<Folder> {
         .with_context(|| format!("{} is not a synced folder", root.display()))
 }
 
-fn print_report(folder: &Folder, r: &ScanReport, verbose: bool) {
-    println!("{}", folder.root.display());
-    let limit = if verbose { usize::MAX } else { LIST_LIMIT };
-    print_list("+ added   ", r.added.iter().map(|p| p.to_string()), limit);
+fn print_report(r: &ScanReport, took: Duration, show_all: bool) {
+    let limit = if show_all { usize::MAX } else { LIST_LIMIT };
+    print_list(
+        "+ added   ",
+        r.added.iter().map(|a| {
+            let plural = if a.chunks == 1 { "" } else { "s" };
+            format!(
+                "{}  ({}, {} chunk{plural})",
+                a.path,
+                human_bytes(a.size),
+                group(a.chunks as u64)
+            )
+        }),
+        limit,
+    );
     print_list(
         "~ modified",
         r.modified.iter().map(|m| {
+            if m.chunks_new == m.chunks_total {
+                return format!("{}  ({}, whole file changed)", m.path, human_bytes(m.size));
+            }
             format!(
-                "{}  ({} of {} chunks changed: {} to send of {})",
+                "{}  ({} of {} chunks changed: only {} of {} needs sending)",
                 m.path,
-                m.chunks_new,
-                m.chunks_total,
+                group(m.chunks_new as u64),
+                group(m.chunks_total as u64),
                 human_bytes(m.new_bytes),
                 human_bytes(m.size)
             )
         }),
         limit,
     );
-    print_list("- deleted ", r.deleted.iter().map(|p| p.to_string()), limit);
+    print_list(
+        "- deleted ",
+        r.deleted
+            .iter()
+            .map(|p| format!("{p}  (your other devices will delete it too)")),
+        limit,
+    );
     print_list(
         "! skipped ",
         r.skipped
             .iter()
-            .map(|s| format!("{}: {}", s.path.display(), s.reason)),
+            .map(|s| format!("{}  ({})", s.path.display(), s.reason)),
         limit,
     );
+    if !r.has_changes() {
+        println!("  No changes since the last scan.");
+    }
+    let plural = if r.read_files == 1 { "" } else { "s" };
+    let mut detail = format!(
+        "  Read {} file{plural} ({}) in {:.2} s",
+        group(r.read_files as u64),
+        human_bytes(r.read_bytes),
+        took.as_secs_f64()
+    );
+    if r.trusted > 0 {
+        detail += &format!(
+            "; {} unchanged by size and modification time, so not re-read",
+            group(r.trusted as u64)
+        );
+    }
+    println!("{detail}.");
     println!(
-        "  {} added, {} modified, {} deleted, {} unchanged, {} skipped",
+        "  {} added, {} modified, {} deleted, {} unchanged, {} skipped.",
         r.added.len(),
         r.modified.len(),
         r.deleted.len(),
@@ -225,8 +291,48 @@ fn print_list(label: &str, items: impl ExactSizeIterator<Item = String>, limit: 
         println!("  {label}  {item}");
     }
     if total > limit {
-        println!("  {label}  ... and {} more (use --verbose)", total - limit);
+        println!(
+            "  {label}  ... and {} more (use -v to list all)",
+            total - limit
+        );
     }
+}
+
+fn init_logging(verbose: u8) {
+    let level = match verbose {
+        0 => tracing::Level::WARN,
+        1 => tracing::Level::INFO,
+        _ => tracing::Level::DEBUG,
+    };
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .without_time()
+        .init();
+}
+
+/// Shows paths under the user's home directory as `~/...`.
+fn tilde(p: &Path) -> String {
+    match directories::BaseDirs::new()
+        .and_then(|b| p.strip_prefix(b.home_dir()).ok().map(Path::to_path_buf))
+    {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => p.display().to_string(),
+    }
+}
+
+/// `12203` -> `12,203`.
+fn group(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn human_bytes(n: u64) -> String {
@@ -241,5 +347,25 @@ fn human_bytes(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groups_thousands() {
+        assert_eq!(group(0), "0");
+        assert_eq!(group(999), "999");
+        assert_eq!(group(12_203), "12,203");
+        assert_eq!(group(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn human_sizes() {
+        assert_eq!(human_bytes(5), "5 B");
+        assert_eq!(human_bytes(2_355), "2.3 KiB");
+        assert_eq!(human_bytes(100_000_000), "95.4 MiB");
     }
 }

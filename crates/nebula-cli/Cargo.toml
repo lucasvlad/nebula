@@ -19,6 +19,8 @@ directories = "6.0.0"
 nebula-core = { version = "0.1.0", path = "../nebula-core" }
 nebula-net = { version = "0.1.0", path = "../nebula-net" }
 nebula-sync = { version = "0.1.0", path = "../nebula-sync" }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "ansi"] }
 
 [lints]
 workspace = true

@@ -42,7 +42,11 @@ impl RelPath {
             return Err(PathError::Empty);
         }
         let bytes = s.as_bytes();
-        let drive_prefix = bytes[0].is_ascii_alphabetic() && bytes.get(1) == Some(&b':');
+        // `C:`, `C:/...` or `C:\...`. Other names with a colon, such as
+        // `a:b.txt`, are rejected below for the colon itself.
+        let drive_prefix = bytes[0].is_ascii_alphabetic()
+            && bytes.get(1) == Some(&b':')
+            && matches!(bytes.get(2), None | Some(b'/' | b'\\'));
         if s.starts_with(['/', '\\']) || drive_prefix {
             return Err(PathError::Absolute);
         }
@@ -223,9 +227,12 @@ mod tests {
     #[test]
     fn rejects_empty_and_absolute() {
         assert_eq!(RelPath::new(""), Err(PathError::Empty));
-        for s in ["/x", "\\x", "C:foo", "c:\\foo", "z:"] {
+        for s in ["/x", "\\x", "C:/foo", "c:\\foo", "z:"] {
             assert_eq!(RelPath::new(s), Err(PathError::Absolute), "{s}");
         }
+        // A colon in a relative name is a bad character, not a drive.
+        assert_eq!(RelPath::new("C:foo"), Err(PathError::BadChar(':')));
+        assert_eq!(RelPath::new("a:b.txt"), Err(PathError::BadChar(':')));
     }
 
     #[test]
