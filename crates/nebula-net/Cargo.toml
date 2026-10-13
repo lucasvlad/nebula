@@ -9,6 +9,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+nebula-core = { version = "0.1.0", path = "../nebula-core" }
+snow = "0.10.0"
+thiserror = "2.0.21"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

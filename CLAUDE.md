@@ -17,6 +17,9 @@ cargo audit
 cargo run -p nebula-cli -- <args>     # runs the `nebula` binary
 ```
 
+`--home <dir>` / `NEBULA_HOME` selects the state directory (identity key + `state.db`),
+so two "devices" can run on one machine for testing.
+
 Run fmt, clippy and the tests before every commit. CI runs the same checks
 on ubuntu, macos and windows.
 
