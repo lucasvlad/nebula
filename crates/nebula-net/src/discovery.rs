@@ -97,7 +97,7 @@ pub fn advertise(
 /// window (deduped by instance fullname, addresses merged).
 pub async fn browse(kind: ServiceKind, timeout: Duration) -> Result<Vec<Found>, DiscoveryError> {
     let daemon = ServiceDaemon::new()?;
-    let result = browse_with(&daemon, kind, timeout).await;
+    let result = browse_with(&daemon, kind, timeout, |_| false).await;
     let _ = daemon.stop_browse(kind.service_type());
     let _ = daemon.shutdown();
     result
@@ -107,6 +107,7 @@ async fn browse_with(
     daemon: &ServiceDaemon,
     kind: ServiceKind,
     timeout: Duration,
+    done: impl Fn(&Found) -> bool,
 ) -> Result<Vec<Found>, DiscoveryError> {
     let rx = daemon.browse(kind.service_type())?;
     let deadline = Instant::now() + timeout;
@@ -134,6 +135,9 @@ async fn browse_with(
             }
         }
         sort_addrs(&mut entry.addrs);
+        if done(entry) {
+            break;
+        }
     }
     Ok(order.into_iter().filter_map(|n| seen.remove(&n)).collect())
 }
@@ -143,10 +147,13 @@ pub async fn find_device(
     device: &DeviceId,
     timeout: Duration,
 ) -> Result<Option<Found>, DiscoveryError> {
-    let all = browse(ServiceKind::Sync, timeout).await?;
-    Ok(all
-        .into_iter()
-        .find(|f| f.device_id.as_ref() == Some(device)))
+    // Stop as soon as the device resolves rather than waiting out the timeout.
+    let daemon = ServiceDaemon::new()?;
+    let wanted = |f: &Found| f.device_id.as_ref() == Some(device) && !f.addrs.is_empty();
+    let result = browse_with(&daemon, ServiceKind::Sync, timeout, wanted).await;
+    let _ = daemon.stop_browse(ServiceKind::Sync.service_type());
+    let _ = daemon.shutdown();
+    Ok(result?.into_iter().find(wanted))
 }
 
 fn sort_addrs(addrs: &mut [SocketAddr]) {
