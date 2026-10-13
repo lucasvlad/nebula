@@ -41,6 +41,10 @@ CREATE TABLE peers (
     last_addr  TEXT,
     paired_at  INTEGER NOT NULL
 ) WITHOUT ROWID;
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+) WITHOUT ROWID;
 ",
 ];
 
@@ -270,6 +274,24 @@ impl Store {
             .is_some())
     }
 
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [key, value],
+        )?;
+        Ok(())
+    }
+
     pub fn set_peer_addr(&self, device: &DeviceId, addr: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE peers SET last_addr = ?2 WHERE device_id = ?1",
@@ -428,6 +450,15 @@ mod tests {
         assert!(store.remove_peer(&laptop.device_id).unwrap());
         assert!(!store.remove_peer(&laptop.device_id).unwrap());
         assert!(!store.is_paired(&laptop.public_key).unwrap());
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.setting("name").unwrap(), None);
+        store.set_setting("name", "laptop").unwrap();
+        store.set_setting("name", "MacBook").unwrap();
+        assert_eq!(store.setting("name").unwrap().as_deref(), Some("MacBook"));
     }
 
     #[test]
