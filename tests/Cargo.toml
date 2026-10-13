@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
 
 [lints]
 workspace = true
