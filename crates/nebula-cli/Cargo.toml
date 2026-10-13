@@ -1,0 +1,19 @@
+[package]
+name = "nebula-cli"
+description = "The `nebula` command-line tool and daemon."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "nebula"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+
+[lints]
+workspace = true

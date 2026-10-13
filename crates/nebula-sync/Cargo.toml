@@ -1,0 +1,14 @@
+[package]
+name = "nebula-sync"
+description = "Scanner, watcher, index exchange, chunk transfer and atomic apply."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

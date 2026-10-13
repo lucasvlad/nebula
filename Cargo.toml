@@ -1,7 +1,22 @@
-[package]
-name = "nebula"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "3"
+members = ["crates/*", "tests"]
 
-[dependencies]
-gpui = "0.2.2"
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/lucasvlad/nebula"
+
+[workspace.dependencies]
+nebula-core = { path = "crates/nebula-core" }
+nebula-net = { path = "crates/nebula-net" }
+nebula-sync = { path = "crates/nebula-sync" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
