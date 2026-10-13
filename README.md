@@ -23,6 +23,20 @@ cargo build --release      # binary at target/release/nebula
 cargo test --workspace
 ```
 
+## Usage
+
+```sh
+nebula add ~/Documents/Shared     # opt a folder in (nothing syncs by default)
+nebula scan                       # index changes in every synced folder
+nebula ls ~/Documents/Shared      # what Nebula knows about each file
+nebula folders                    # list synced folders
+nebula remove ~/Documents/Shared  # stop syncing; files are left alone
+nebula id                         # this device's ID
+```
+
+State lives in the OS data directory. Pass `--home <dir>` or set
+`NEBULA_HOME` to use another one (handy for running two devices on one machine).
+
 ## Layout
 
 | Path | Contents |
