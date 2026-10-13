@@ -28,6 +28,12 @@ pub fn device_name(store: &Store) -> Result<String> {
     Ok(name)
 }
 
+pub fn set_device_name(store: &Store, name: &str) -> Result<String> {
+    let name = clean_name(name);
+    store.set_setting("name", &name)?;
+    Ok(name)
+}
+
 fn clean_name(raw: &str) -> String {
     let raw = raw.trim().trim_end_matches(".local");
     let mut name = String::new();
@@ -60,7 +66,9 @@ pub async fn listen(identity: &Identity, store: &Store, port: u16) -> Result<()>
     let _advert = match discovery::advertise(ServiceKind::Pairing, &identity.device_id(), port) {
         Ok(a) => Some(a),
         Err(e) => {
-            warn!("could not announce on the local network ({e}); the other device will need --addr");
+            warn!(
+                "could not announce on the local network ({e}); the other device will need --addr"
+            );
             None
         }
     };
@@ -88,7 +96,12 @@ pub async fn listen(identity: &Identity, store: &Store, port: u16) -> Result<()>
 }
 
 /// Device B: join a device that is showing `code`.
-pub async fn join(identity: &Identity, store: &Store, code: &str, addr: Option<&str>) -> Result<()> {
+pub async fn join(
+    identity: &Identity,
+    store: &Store,
+    code: &str,
+    addr: Option<&str>,
+) -> Result<()> {
     let code = PairingCode::parse(code)?;
     let name = device_name(store)?;
     let candidates = match addr {
@@ -196,7 +209,11 @@ pub fn find_peer(store: &Store, who: &str) -> Result<Peer> {
 
 /// Accepts `host:port`, or just `host` to use `default_port`.
 pub async fn resolve(addr: &str, default_port: u16) -> Result<Vec<SocketAddr>> {
-    let with_port = if addr.parse::<SocketAddr>().is_ok() || addr.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
+    let with_port = if addr.parse::<SocketAddr>().is_ok()
+        || addr
+            .rsplit_once(':')
+            .is_some_and(|(_, p)| p.parse::<u16>().is_ok())
+    {
         addr.to_string()
     } else {
         format!("{addr}:{default_port}")

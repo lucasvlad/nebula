@@ -82,7 +82,7 @@ pub struct Session<S> {
 pub async fn connect<S>(
     stream: S,
     identity: &Identity,
-    is_allowed: impl Fn(&[u8; KEY_LEN]) -> bool,
+    is_allowed: impl Fn(&[u8; KEY_LEN]) -> bool + Sync,
 ) -> Result<Session<S>, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -95,7 +95,7 @@ where
 pub async fn accept<S>(
     stream: S,
     identity: &Identity,
-    is_allowed: impl Fn(&[u8; KEY_LEN]) -> bool,
+    is_allowed: impl Fn(&[u8; KEY_LEN]) -> bool + Sync,
 ) -> Result<Session<S>, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -114,7 +114,7 @@ async fn with_timeout<T>(
 async fn handshake<S>(
     mut stream: S,
     identity: &Identity,
-    is_allowed: &dyn Fn(&[u8; KEY_LEN]) -> bool,
+    is_allowed: &(dyn Fn(&[u8; KEY_LEN]) -> bool + Sync),
     initiator: bool,
 ) -> Result<Session<S>, TransportError>
 where
@@ -172,7 +172,7 @@ async fn read_handshake<S: AsyncRead + Unpin>(
 
 fn allowed_remote(
     hs: &snow::HandshakeState,
-    is_allowed: &dyn Fn(&[u8; KEY_LEN]) -> bool,
+    is_allowed: &(dyn Fn(&[u8; KEY_LEN]) -> bool + Sync),
 ) -> Result<[u8; KEY_LEN], TransportError> {
     let remote: [u8; KEY_LEN] = hs
         .get_remote_static()
@@ -307,7 +307,7 @@ mod tests {
         (Identity::generate().unwrap(), Identity::generate().unwrap())
     }
 
-    fn only(key: [u8; KEY_LEN]) -> impl Fn(&[u8; KEY_LEN]) -> bool {
+    fn only(key: [u8; KEY_LEN]) -> impl Fn(&[u8; KEY_LEN]) -> bool + Sync {
         move |k| *k == key
     }
 

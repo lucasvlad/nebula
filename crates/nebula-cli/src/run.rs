@@ -42,7 +42,10 @@ pub async fn run(identity: Identity, store: Store, port: u16) -> Result<()> {
         if peers == 1 { "" } else { "s" }
     );
     if let Some(ip) = pair::local_ips().first() {
-        println!("Other devices can reach it at {}.", SocketAddr::new(*ip, port));
+        println!(
+            "Other devices can reach it at {}.",
+            SocketAddr::new(*ip, port)
+        );
     }
     println!("Press Ctrl+C to stop.");
 
@@ -81,6 +84,13 @@ async fn serve(
             warn!(
                 "refused a connection from {addr}: device {} is not paired with this one",
                 device.short()
+            );
+            return;
+        }
+        Err(TransportError::Io(e)) if is_closed(&e) => {
+            info!(
+                "{addr} hung up during the secure handshake \
+                 (probably a device that is not paired with this one)"
             );
             return;
         }
@@ -132,11 +142,13 @@ pub async fn ping(
     addr: Option<&str>,
     count: u32,
 ) -> Result<()> {
+    if store.peers()?.is_empty() {
+        bail!("this device is not paired with anything yet. Pair first with `nebula pair`");
+    }
     let target = match who {
         Some(who) => Some(pair::find_peer(&store, who)?),
         None if addr.is_some() => None,
         None => match store.peers()?.as_slice() {
-            [] => bail!("no paired devices. Pair one with `nebula pair`"),
             [only] => Some(only.clone()),
             _ => bail!("which device? Name one (see `nebula peers`) or pass --addr"),
         },
@@ -166,13 +178,17 @@ pub async fn ping(
 
     let stream = pair::connect_any(&addrs).await?;
     let remote = stream.peer_addr()?;
-    let allowed = |key: &[u8; 32]| match &target {
-        Some(peer) => key == &peer.public_key,
-        None => store.is_paired(key).unwrap_or(false),
+    // With a named target only that device may answer; with a bare --addr,
+    // any paired device may.
+    let allowed_keys: Vec<[u8; 32]> = match &target {
+        Some(peer) => vec![peer.public_key],
+        None => store.peers()?.iter().map(|p| p.public_key).collect(),
     };
+
+    let allowed = |key: &[u8; 32]| allowed_keys.contains(key);
     let mut session = transport::connect(stream, &identity, allowed)
         .await
-        .map_err(explain_refusal)?;
+        .map_err(|e| explain_refusal(e, target.is_some()))?;
     let device = session.remote_device();
     send(&mut session, &hello(&pair::device_name(&store)?)).await?;
     match recv(&mut session).await? {
@@ -187,7 +203,9 @@ pub async fn ping(
         "Connected to \"{name}\" (device {}) at {remote}.",
         device.short()
     );
-    println!("The connection is encrypted, and both devices proved they are paired with each other.");
+    println!(
+        "The connection is encrypted, and both devices proved they are paired with each other."
+    );
 
     for nonce in 0..u64::from(count) {
         let started = Instant::now();
@@ -238,29 +256,30 @@ async fn recv<S: AsyncRead + AsyncWrite + Unpin>(s: &mut Session<S>) -> Result<M
     Message::decode(&bytes).map_err(|e| anyhow!("peer sent a malformed message: {e}"))
 }
 
-fn is_hangup(e: &anyhow::Error) -> bool {
+fn is_closed(e: &std::io::Error) -> bool {
     matches!(
-        e.downcast_ref::<TransportError>(),
-        Some(TransportError::Io(io)) if matches!(
-            io.kind(),
-            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-        )
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
     )
 }
 
-fn explain_refusal(e: TransportError) -> anyhow::Error {
+fn is_hangup(e: &anyhow::Error) -> bool {
+    matches!(e.downcast_ref::<TransportError>(), Some(TransportError::Io(io)) if is_closed(io))
+}
+
+fn explain_refusal(e: TransportError, named_target: bool) -> anyhow::Error {
     match e {
-        TransportError::NotAllowed(device) => anyhow!(
-            "the device that answered is {}, which is not the paired device you asked for; \
+        TransportError::NotAllowed(device) if named_target => anyhow!(
+            "the device that answered is {}, not the paired device you asked for; \
              nothing was sent to it",
             device.short()
         ),
-        TransportError::Io(io)
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-            ) =>
-        {
+        TransportError::NotAllowed(device) => anyhow!(
+            "the device that answered is {}, which is not paired with this one; \
+             nothing was sent to it",
+            device.short()
+        ),
+        TransportError::Io(io) if is_closed(&io) => {
             anyhow!(
                 "the other device refused the connection. It is probably not paired with this \
                  one; check `nebula peers` on both"
