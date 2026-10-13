@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use nebula_core::DeviceId;
 
-const NOISE_PARAMS: &str = "Noise_KK_25519_ChaChaPoly_BLAKE2s";
+/// Noise protocol name for sessions (ADR 0004). Also used for key generation.
+pub(crate) const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const KEY_LEN: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
