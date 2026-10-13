@@ -269,7 +269,10 @@ mod tests {
         let mut expected = saved.clone();
         expected.sort_by(|a, b| a.path.cmp(&b.path));
         assert_eq!(loaded, expected);
-        assert_eq!(store.folder(Path::new("/r")).unwrap().unwrap().last_scan_ns, 42);
+        assert_eq!(
+            store.folder(Path::new("/r")).unwrap().unwrap().last_scan_ns,
+            42
+        );
     }
 
     #[test]

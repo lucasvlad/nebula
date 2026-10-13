@@ -131,7 +131,9 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
     for found in walk.files {
         seen.insert(found.path.clone());
         if collisions.contains(&found.path) {
-            report.skipped.push(skip(&folder.root, &found.abs, SkipReason::CaseCollision));
+            report
+                .skipped
+                .push(skip(&folder.root, &found.abs, SkipReason::CaseCollision));
             continue;
         }
         let old = known.get(&found.path).filter(|e| !e.deleted);
@@ -143,18 +145,23 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
             }
         }
 
-        let chunked = match File::open(&found.abs).and_then(|f| chunk_all(f, RollingChunker::default())) {
-            Ok(c) => c,
-            Err(e) => {
-                report.skipped.push(skip(&folder.root, &found.abs, SkipReason::Unreadable(e)));
-                continue;
-            }
-        };
+        let chunked =
+            match File::open(&found.abs).and_then(|f| chunk_all(f, RollingChunker::default())) {
+                Ok(c) => c,
+                Err(e) => {
+                    report
+                        .skipped
+                        .push(skip(&folder.root, &found.abs, SkipReason::Unreadable(e)));
+                    continue;
+                }
+            };
         // If the file moved under us, the hash may mix two versions.
         match fs::symlink_metadata(&found.abs) {
             Ok(m) if m.len() == found.size && mtime_ns(&m) == found.mtime_ns => {}
             _ => {
-                report.skipped.push(skip(&folder.root, &found.abs, SkipReason::Changing));
+                report
+                    .skipped
+                    .push(skip(&folder.root, &found.abs, SkipReason::Changing));
                 continue;
             }
         }
@@ -253,7 +260,8 @@ fn walk_dir(root: &Path, dir: &Path, walk: &mut Walk) {
         let meta = match fs::symlink_metadata(&abs) {
             Ok(meta) => meta,
             Err(e) => {
-                walk.skipped.push(skip(root, &abs, SkipReason::Unreadable(e)));
+                walk.skipped
+                    .push(skip(root, &abs, SkipReason::Unreadable(e)));
                 walk.skipped_paths.insert(path);
                 continue;
             }
@@ -280,7 +288,8 @@ fn blind(root: &Path, dir: &Path, e: io::Error, walk: &mut Walk) {
     if let Ok(path) = rel_path(root, dir) {
         walk.blind_dirs.push(path);
     }
-    walk.skipped.push(skip(root, dir, SkipReason::Unreadable(e)));
+    walk.skipped
+        .push(skip(root, dir, SkipReason::Unreadable(e)));
 }
 
 fn rel_path(root: &Path, abs: &Path) -> Result<RelPath, SkipReason> {
@@ -380,7 +389,12 @@ mod tests {
     }
 
     fn set_mtime(p: &Path, t: SystemTime) {
-        File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+        File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
     }
 
     fn paths(v: &[RelPath]) -> Vec<&str> {
@@ -397,7 +411,10 @@ mod tests {
         let b = fx.entry("sub/dir/b.bin");
         assert_eq!(b.size, 100_000);
         assert_eq!(b.version.get(&DEV), 1);
-        assert_eq!(b.chunks.iter().map(|c| u64::from(c.len)).sum::<u64>(), 100_000);
+        assert_eq!(
+            b.chunks.iter().map(|c| u64::from(c.len)).sum::<u64>(),
+            100_000
+        );
     }
 
     #[test]
@@ -415,7 +432,9 @@ mod tests {
     #[test]
     fn edit_bumps_version_and_reports_new_chunks() {
         let mut fx = Fixture::new();
-        let mut data: Vec<u8> = (0..1_000_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let mut data: Vec<u8> = (0..1_000_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
         fx.write("big.bin", &data);
         fx.scan();
         let before = fx.entry("big.bin");
@@ -424,7 +443,11 @@ mod tests {
         let r = fx.scan();
         assert_eq!(r.modified.len(), 1);
         let m = &r.modified[0];
-        assert!(m.chunks_new <= 2, "one-byte edit changed {} chunks", m.chunks_new);
+        assert!(
+            m.chunks_new <= 2,
+            "one-byte edit changed {} chunks",
+            m.chunks_new
+        );
         assert!(m.new_bytes < 150_000);
         let after = fx.entry("big.bin");
         assert_eq!(after.version.compare(&before.version), Causality::After);
