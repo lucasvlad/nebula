@@ -9,9 +9,11 @@ use nebula_core::path::{PathError, RelPath};
 use nebula_core::{DeviceId, Digest};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-const SCHEMA_VERSION: i64 = 1;
-
-const SCHEMA: &str = "
+/// Schema migrations, applied in order. `PRAGMA user_version` records how
+/// many have run.
+const MIGRATIONS: &[&str] = &[
+    // 1: folders and manifests
+    "
 CREATE TABLE folders (
     id           INTEGER PRIMARY KEY,
     root         TEXT NOT NULL UNIQUE,
@@ -29,7 +31,18 @@ CREATE TABLE files (
     deleted      INTEGER NOT NULL,
     PRIMARY KEY (folder_id, path)
 ) WITHOUT ROWID;
-";
+",
+    // 2: the allowlist of paired devices
+    "
+CREATE TABLE peers (
+    device_id  BLOB PRIMARY KEY,
+    public_key BLOB NOT NULL UNIQUE,
+    name       TEXT NOT NULL,
+    last_addr  TEXT,
+    paired_at  INTEGER NOT NULL
+) WITHOUT ROWID;
+",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -59,6 +72,16 @@ pub struct Folder {
     pub last_scan_ns: i64,
 }
 
+/// A device on the allowlist. Only these may connect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    pub device_id: DeviceId,
+    pub public_key: [u8; 32],
+    pub name: String,
+    /// Where we last reached it, as `host:port`.
+    pub last_addr: Option<String>,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -78,13 +101,16 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => {
-                conn.execute_batch(SCHEMA)?;
-                conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            SCHEMA_VERSION => {}
-            v => return Err(StoreError::UnknownSchema(v)),
+        let applied = usize::try_from(version).unwrap_or(usize::MAX);
+        if applied > MIGRATIONS.len() {
+            return Err(StoreError::UnknownSchema(version));
+        }
+        let mut conn = conn;
+        for (i, sql) in MIGRATIONS.iter().enumerate().skip(applied) {
+            let tx = conn.transaction()?;
+            tx.execute_batch(sql)?;
+            tx.pragma_update(None, "user_version", i as i64 + 1)?;
+            tx.commit()?;
         }
         Ok(Self { conn })
     }
@@ -185,6 +211,81 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
+
+impl Store {
+    /// Adds a device to the allowlist, or updates its name if re-paired.
+    pub fn add_peer(&self, peer: &Peer) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO peers (device_id, public_key, name, last_addr, paired_at)
+             VALUES (?1, ?2, ?3, ?4, unixepoch())
+             ON CONFLICT (device_id) DO UPDATE SET name = excluded.name",
+            params![
+                &peer.device_id.0[..],
+                &peer.public_key[..],
+                peer.name,
+                peer.last_addr
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a device from the allowlist. Returns false if it was not there.
+    pub fn remove_peer(&self, device: &DeviceId) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM peers WHERE device_id = ?1", [&device.0[..]])?;
+        Ok(n > 0)
+    }
+
+    pub fn peers(&self) -> Result<Vec<Peer>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT device_id, public_key, name, last_addr FROM peers ORDER BY name")?;
+        let rows = stmt.query_map([], peer_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn peer(&self, device: &DeviceId) -> Result<Option<Peer>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT device_id, public_key, name, last_addr FROM peers WHERE device_id = ?1",
+                [&device.0[..]],
+                peer_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Whether this static public key belongs to a paired device.
+    pub fn is_paired(&self, public_key: &[u8; 32]) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM peers WHERE public_key = ?1",
+                [&public_key[..]],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn set_peer_addr(&self, device: &DeviceId, addr: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE peers SET last_addr = ?2 WHERE device_id = ?1",
+            params![&device.0[..], addr],
+        )?;
+        Ok(())
+    }
+}
+
+fn peer_from_row(row: &Row<'_>) -> rusqlite::Result<Peer> {
+    Ok(Peer {
+        device_id: DeviceId(row.get(0)?),
+        public_key: row.get(1)?,
+        name: row.get(2)?,
+        last_addr: row.get(3)?,
+    })
 }
 
 fn root_text(root: &Path) -> Result<&str> {
@@ -294,6 +395,79 @@ mod tests {
         store.remove_folder(Path::new("/r")).unwrap();
         let g = store.add_folder(Path::new("/r")).unwrap();
         assert!(store.files(g.id).unwrap().is_empty());
+    }
+
+    fn peer(n: u8, name: &str) -> Peer {
+        let public_key = [n; 32];
+        Peer {
+            device_id: DeviceId::from_public_key(&public_key),
+            public_key,
+            name: name.to_string(),
+            last_addr: None,
+        }
+    }
+
+    #[test]
+    fn allowlist_add_check_remove() {
+        let store = Store::open_in_memory().unwrap();
+        let laptop = peer(1, "laptop");
+        assert!(!store.is_paired(&laptop.public_key).unwrap());
+        store.add_peer(&laptop).unwrap();
+        store.add_peer(&peer(2, "desktop")).unwrap();
+        assert!(store.is_paired(&laptop.public_key).unwrap());
+        assert!(!store.is_paired(&[9; 32]).unwrap());
+        let names: Vec<String> = store.peers().unwrap().into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["desktop", "laptop"]);
+
+        store
+            .set_peer_addr(&laptop.device_id, "192.168.1.5:7878")
+            .unwrap();
+        let got = store.peer(&laptop.device_id).unwrap().unwrap();
+        assert_eq!(got.last_addr.as_deref(), Some("192.168.1.5:7878"));
+
+        assert!(store.remove_peer(&laptop.device_id).unwrap());
+        assert!(!store.remove_peer(&laptop.device_id).unwrap());
+        assert!(!store.is_paired(&laptop.public_key).unwrap());
+    }
+
+    #[test]
+    fn repairing_updates_name() {
+        let store = Store::open_in_memory().unwrap();
+        store.add_peer(&peer(1, "old")).unwrap();
+        store.add_peer(&peer(1, "new")).unwrap();
+        let peers = store.peers().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "new");
+    }
+
+    #[test]
+    fn migrates_a_version_1_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute("INSERT INTO folders (root) VALUES ('/r')", [])
+                .unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.folders().unwrap().len(), 1);
+        store.add_peer(&peer(1, "laptop")).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_newer_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        Connection::open(&db)
+            .unwrap()
+            .pragma_update(None, "user_version", 99)
+            .unwrap();
+        assert!(matches!(
+            Store::open(&db),
+            Err(StoreError::UnknownSchema(99))
+        ));
     }
 
     #[test]
