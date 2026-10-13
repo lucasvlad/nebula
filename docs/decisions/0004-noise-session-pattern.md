@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-10-13
-- **Milestone / PR:** M2 / TBD
+- **Milestone / PR:** M2 / #5
 
 ## Context
 
