@@ -32,7 +32,23 @@ nebula ls ~/Documents/Shared      # what Nebula knows about each file
 nebula folders                    # list synced folders
 nebula remove ~/Documents/Shared  # stop syncing; files are left alone
 nebula id                         # this device's ID
+nebula scan -v                    # explain what was found (-vv: every decision)
 ```
+
+Pairing and connecting (run each half on a different device):
+
+```sh
+nebula pair                       # device A: shows a code like 123-456
+nebula pair 123-456               # device B: finds A on the network and pairs
+nebula peers                      # list paired devices
+nebula run                        # accept encrypted connections from paired devices
+nebula ping                       # from the other device: connect and time round trips
+nebula unpair <name>              # revoke a device
+```
+
+If the network blocks discovery (common on campus Wi-Fi), add
+`--addr <ip>[:port]` to `pair` and `ping`. `nebula pair` and `nebula run`
+print the address to use.
 
 State lives in the OS data directory. Pass `--home <dir>` or set
 `NEBULA_HOME` to use another one (handy for running two devices on one machine).

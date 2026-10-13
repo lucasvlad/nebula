@@ -1,5 +1,8 @@
 //! The `nebula` command-line tool.
 
+mod pair;
+mod run;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -42,6 +45,40 @@ enum Command {
     },
     /// Show what Nebula knows about the files in a synced folder.
     Ls { folder: PathBuf },
+    /// Pair with another device. Run with no code to show one, then run
+    /// `nebula pair <code>` on the other device.
+    Pair {
+        /// The code shown on the other device.
+        code: Option<String>,
+        /// The other device's address, if discovery doesn't find it.
+        #[arg(long, value_name = "HOST[:PORT]")]
+        addr: Option<String>,
+        /// Port to listen on while showing a code.
+        #[arg(long, default_value_t = pair::PAIR_PORT)]
+        port: u16,
+    },
+    /// Show or change the name other devices see for this one.
+    Name { new_name: Option<String> },
+    /// List paired devices.
+    Peers,
+    /// Remove a device from the paired list, by name or device ID.
+    Unpair { device: String },
+    /// Run Nebula: accept encrypted connections from paired devices.
+    Run {
+        #[arg(long, default_value_t = run::RUN_PORT)]
+        port: u16,
+    },
+    /// Open an encrypted connection to a paired device and time a few round trips.
+    Ping {
+        /// Paired device name or ID (optional if there is only one).
+        device: Option<String>,
+        /// Connect to this address instead of looking the device up.
+        #[arg(long, value_name = "HOST[:PORT]")]
+        addr: Option<String>,
+        /// How many pings to send.
+        #[arg(short = 'c', long, default_value_t = 3)]
+        count: u32,
+    },
 }
 
 /// How many paths to print per category before summarising.
@@ -49,7 +86,9 @@ const LIST_LIMIT: usize = 10;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_logging(cli.verbose);
+    // `run` is a long-lived process, so it narrates by default.
+    let base = u8::from(matches!(cli.command, Command::Run { .. }));
+    init_logging(cli.verbose.saturating_add(base));
     let home = match cli.home {
         Some(home) => home,
         None => default_home()?,
@@ -150,6 +189,51 @@ fn main() -> Result<()> {
                 device.short()
             );
             println!("CONTENT is the start of the file's BLAKE3 hash: same hash, same bytes.");
+        }
+        Command::Pair { code, addr, port } => {
+            let identity = identity(&home)?;
+            let store = open_store(&home)?;
+            let rt = tokio::runtime::Runtime::new()?;
+            match code {
+                Some(code) => rt.block_on(pair::join(&identity, &store, &code, addr.as_deref()))?,
+                None => rt.block_on(pair::listen(&identity, &store, port))?,
+            }
+        }
+        Command::Name { new_name } => {
+            let store = open_store(&home)?;
+            match new_name {
+                Some(name) => {
+                    let name = pair::set_device_name(&store, &name)?;
+                    println!("This device is now called \"{name}\".");
+                    println!(
+                        "Devices you pair with from now on will see this name. \
+                         Already-paired devices keep the old one until you pair again."
+                    );
+                }
+                None => println!("{}", pair::device_name(&store)?),
+            }
+        }
+        Command::Peers => pair::list(&open_store(&home)?)?,
+        Command::Unpair { device } => pair::unpair(&open_store(&home)?, &device)?,
+        Command::Run { port } => {
+            let identity = identity(&home)?;
+            let store = open_store(&home)?;
+            tokio::runtime::Runtime::new()?.block_on(run::run(identity, store, port))?;
+        }
+        Command::Ping {
+            device,
+            addr,
+            count,
+        } => {
+            let identity = identity(&home)?;
+            let store = open_store(&home)?;
+            tokio::runtime::Runtime::new()?.block_on(run::ping(
+                identity,
+                store,
+                device.as_deref(),
+                addr.as_deref(),
+                count,
+            ))?;
         }
     }
     Ok(())
