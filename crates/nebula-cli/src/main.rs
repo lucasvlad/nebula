@@ -1,5 +1,6 @@
 //! The `nebula` command-line tool.
 
+mod daemon;
 mod pair;
 mod run;
 
@@ -69,10 +70,14 @@ enum Command {
     Peers,
     /// Remove a device from the paired list, by name or device ID.
     Unpair { device: String },
-    /// Run Nebula: accept encrypted connections from paired devices.
+    /// Run Nebula: stay connected to paired devices and sync folders with them.
     Run {
         #[arg(long, default_value_t = run::RUN_PORT)]
         port: u16,
+        /// Also connect to a paired device at this address (repeatable), for
+        /// networks where devices cannot find each other automatically.
+        #[arg(long = "connect", value_name = "HOST[:PORT]")]
+        connect: Vec<String>,
     },
     /// Open an encrypted connection to a paired device and time a few round trips.
     Ping {
@@ -224,10 +229,12 @@ fn main() -> Result<()> {
         }
         Command::Peers => pair::list(&open_store(&home)?)?,
         Command::Unpair { device } => pair::unpair(&open_store(&home)?, &device)?,
-        Command::Run { port } => {
+        Command::Run { port, connect } => {
             let identity = identity(&home)?;
             let store = open_store(&home)?;
-            tokio::runtime::Runtime::new()?.block_on(run::run(identity, store, port))?;
+            let db = home.join("state.db");
+            tokio::runtime::Runtime::new()?
+                .block_on(daemon::run(identity, store, &db, port, connect))?;
         }
         Command::Ping {
             device,
