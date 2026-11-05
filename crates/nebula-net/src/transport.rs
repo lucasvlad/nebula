@@ -37,7 +37,9 @@ use crate::sas::SecurityCode;
 
 /// Largest application message accepted by [`Session::send`] and
 /// [`Session::recv`].
-pub const MAX_MESSAGE: usize = 4 * 1024 * 1024;
+/// Large enough for the chunk list of a ~3.5 GB file (36 bytes per 8 KiB
+/// chunk), still small enough that a hostile peer cannot exhaust memory.
+pub const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
 /// A peer that has not finished the handshake by then is dropped.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

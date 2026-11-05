@@ -33,7 +33,13 @@ enum Command {
     /// Show this device's ID.
     Id,
     /// Start syncing a folder.
-    Add { folder: PathBuf },
+    Add {
+        folder: PathBuf,
+        /// Name to sync it under; other devices sync their folder with the
+        /// same name. Defaults to the folder's own name.
+        #[arg(long = "as", value_name = "NAME")]
+        label: Option<String>,
+    },
     /// Stop syncing a folder. Its files are left untouched.
     Remove { folder: PathBuf },
     /// List synced folders.
@@ -101,7 +107,7 @@ fn main() -> Result<()> {
             let id = identity(&home)?;
             println!("{}", id.device_id());
         }
-        Command::Add { folder } => add(&home, &folder)?,
+        Command::Add { folder, label } => add(&home, &folder, label.as_deref())?,
         Command::Remove { folder } => {
             let store = open_store(&home)?;
             let root = std::fs::canonicalize(&folder).unwrap_or(folder);
@@ -125,7 +131,7 @@ fn main() -> Result<()> {
                 } else {
                     ""
                 };
-                println!("{}{state}", f.root.display());
+                println!("{:<20}  {}{state}", f.label, f.root.display());
             }
         }
         Command::Scan { folder } => {
@@ -261,7 +267,7 @@ fn open_store(home: &Path) -> Result<Store> {
     Store::open(&path).with_context(|| format!("opening {}", path.display()))
 }
 
-fn add(home: &Path, folder: &Path) -> Result<()> {
+fn add(home: &Path, folder: &Path, label: Option<&str>) -> Result<()> {
     let root = std::fs::canonicalize(folder)
         .with_context(|| format!("{} does not exist", folder.display()))?;
     if !root.is_dir() {
@@ -286,9 +292,20 @@ fn add(home: &Path, folder: &Path) -> Result<()> {
             );
         }
     }
-    store.add_folder(&root)?;
+    let label = match label {
+        Some(l) => l.trim().to_string(),
+        None => root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "root".to_string()),
+    };
+    if label.is_empty() || label.len() > 64 || label.chars().any(char::is_control) {
+        bail!("folder names must be 1 to 64 characters");
+    }
+    store.add_folder(&root, &label)?;
     println!(
-        "Now syncing {}. Run `nebula scan` to index it.",
+        "Now syncing {} as \"{label}\". On your other devices, add a folder with \
+         the same name (`nebula add <folder> --as \"{label}\"`) to sync them.",
         root.display()
     );
     Ok(())

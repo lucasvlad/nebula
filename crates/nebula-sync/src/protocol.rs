@@ -2,10 +2,12 @@
 //! decoded with bounds (postcard rejects trailing or malformed input) and
 //! must still be validated by the receiver.
 
+use nebula_core::Digest;
+use nebula_core::manifest::FileEntry;
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever a message changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
@@ -24,6 +26,27 @@ pub enum Message {
     /// `nebula ping --message` to show encryption working in a demo.
     Note {
         text: String,
+    },
+    /// Manifest entries for the folder labelled `folder`: everything on
+    /// connect, then whatever changed. Large folders span several messages.
+    Index {
+        folder: String,
+        entries: Vec<FileEntry>,
+    },
+    /// Asks for one chunk, by hash, from the folder labelled `folder`.
+    Request {
+        id: u64,
+        folder: String,
+        hash: Digest,
+    },
+    /// The bytes of a requested chunk. The requester verifies the hash.
+    Chunk {
+        id: u64,
+        data: Vec<u8>,
+    },
+    /// The requested chunk is no longer available (the file changed).
+    Missing {
+        id: u64,
     },
 }
 

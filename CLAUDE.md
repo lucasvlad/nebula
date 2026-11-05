@@ -27,6 +27,8 @@ on ubuntu, macos and windows.
 
 - Never commit directly to `main`. Branch as `feat/<subsystem>`, `fix/<thing>` or `chore/<thing>`.
 - One PR per subsystem, small enough to review. Merge only when CI is green on all three OSes. Squash-merge.
+  Gate the merge on the checks' exit code: `gh pr checks N --watch && gh pr merge N --squash`. Never chain the merge after `;` or after output filtering.
+  If CI cannot run (e.g. GitHub billing lock), say so and get the user's OK before merging on local results alone.
 - When a PR carries a **[paper]** decision from the brief, add an ADR in `docs/decisions/` (copy `0000-template.md`) and link it in the PR.
 - Tag milestone completions on `main`: `m1` … `m6`.
 - The user is the sole developer and tests at each checkpoint. Stop at milestone checkpoints with a progress report and concrete things to test by hand.

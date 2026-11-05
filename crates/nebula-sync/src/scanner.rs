@@ -428,7 +428,7 @@ mod tests {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open_in_memory().unwrap();
-            let folder = store.add_folder(dir.path()).unwrap();
+            let folder = store.add_folder(dir.path(), "test").unwrap();
             Self { dir, store, folder }
         }
 

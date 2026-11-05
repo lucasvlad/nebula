@@ -137,6 +137,8 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
                 let text: String = text.chars().filter(|c| !c.is_control()).take(500).collect();
                 info!("\"{peer_name}\" sent a message, decrypted here: \"{text}\"");
             }
+            // Sync messages are handled by the engine (M3).
+            _ => {}
         }
     }
 }

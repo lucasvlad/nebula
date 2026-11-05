@@ -46,6 +46,12 @@ CREATE TABLE settings (
     value TEXT NOT NULL
 ) WITHOUT ROWID;
 ",
+    // 3: folders sync with the peer folder that has the same label
+    "
+ALTER TABLE folders ADD COLUMN label TEXT NOT NULL DEFAULT '';
+UPDATE folders SET label = 'folder-' || id WHERE label = '';
+CREATE UNIQUE INDEX folders_label ON folders(label);
+",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +66,8 @@ pub enum StoreError {
     NonUtf8Root(PathBuf),
     #[error("{0} is already synced")]
     AlreadySynced(PathBuf),
+    #[error("another synced folder is already called {0:?}")]
+    LabelTaken(String),
     #[error("database schema version {0} is newer than this build supports")]
     UnknownSchema(i64),
 }
@@ -71,6 +79,8 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct Folder {
     pub id: i64,
     pub root: PathBuf,
+    /// Peers sync this folder with their folder of the same label.
+    pub label: String,
     /// When the last completed scan started, in ns since the Unix epoch.
     /// 0 if never scanned.
     pub last_scan_ns: i64,
@@ -119,21 +129,36 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Opts a folder in. `root` should already be canonical.
-    pub fn add_folder(&self, root: &Path) -> Result<Folder> {
+    /// Opts a folder in under `label`. `root` should already be canonical.
+    pub fn add_folder(&self, root: &Path, label: &str) -> Result<Folder> {
         let text = root_text(root)?;
-        let inserted = self.conn.execute(
-            "INSERT INTO folders (root) VALUES (?1) ON CONFLICT (root) DO NOTHING",
-            [text],
-        )?;
-        if inserted == 0 {
+        if self.folder(root)?.is_some() {
             return Err(StoreError::AlreadySynced(root.to_path_buf()));
         }
+        if self.folder_by_label(label)?.is_some() {
+            return Err(StoreError::LabelTaken(label.to_string()));
+        }
+        self.conn.execute(
+            "INSERT INTO folders (root, label) VALUES (?1, ?2)",
+            [text, label],
+        )?;
         Ok(Folder {
             id: self.conn.last_insert_rowid(),
             root: root.to_path_buf(),
+            label: label.to_string(),
             last_scan_ns: 0,
         })
+    }
+
+    pub fn folder_by_label(&self, label: &str) -> Result<Option<Folder>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, root, last_scan_ns, label FROM folders WHERE label = ?1",
+                [label],
+                folder_from_row,
+            )
+            .optional()?)
     }
 
     /// Stops syncing a folder and forgets its manifest. Files on disk are
@@ -148,7 +173,7 @@ impl Store {
     pub fn folders(&self) -> Result<Vec<Folder>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, root, last_scan_ns FROM folders ORDER BY root")?;
+            .prepare("SELECT id, root, last_scan_ns, label FROM folders ORDER BY root")?;
         let rows = stmt.query_map([], folder_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -157,7 +182,7 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, root, last_scan_ns FROM folders WHERE root = ?1",
+                "SELECT id, root, last_scan_ns, label FROM folders WHERE root = ?1",
                 [root_text(root)?],
                 folder_from_row,
             )
@@ -186,6 +211,20 @@ impl Store {
         changed: &[FileEntry],
         scan_started_ns: i64,
     ) -> Result<()> {
+        self.write_entries(folder_id, changed, Some(scan_started_ns))
+    }
+
+    /// Writes entries learned from a peer, in one transaction.
+    pub fn put_files(&mut self, folder_id: i64, entries: &[FileEntry]) -> Result<()> {
+        self.write_entries(folder_id, entries, None)
+    }
+
+    fn write_entries(
+        &mut self,
+        folder_id: i64,
+        changed: &[FileEntry],
+        scan_started_ns: Option<i64>,
+    ) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -208,10 +247,12 @@ impl Store {
                 ])?;
             }
         }
-        tx.execute(
-            "UPDATE folders SET last_scan_ns = ?2 WHERE id = ?1",
-            params![folder_id, scan_started_ns],
-        )?;
+        if let Some(ns) = scan_started_ns {
+            tx.execute(
+                "UPDATE folders SET last_scan_ns = ?2 WHERE id = ?1",
+                params![folder_id, ns],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -320,6 +361,7 @@ fn folder_from_row(row: &Row<'_>) -> rusqlite::Result<Folder> {
         id: row.get(0)?,
         root: PathBuf::from(row.get::<_, String>(1)?),
         last_scan_ns: row.get(2)?,
+        label: row.get(3)?,
     })
 }
 
@@ -366,10 +408,10 @@ mod tests {
     #[test]
     fn add_list_remove_folders() {
         let store = Store::open_in_memory().unwrap();
-        let a = store.add_folder(Path::new("/home/me/a")).unwrap();
-        store.add_folder(Path::new("/home/me/b")).unwrap();
+        let a = store.add_folder(Path::new("/home/me/a"), "a").unwrap();
+        store.add_folder(Path::new("/home/me/b"), "b").unwrap();
         assert!(matches!(
-            store.add_folder(Path::new("/home/me/a")),
+            store.add_folder(Path::new("/home/me/a"), "a"),
             Err(StoreError::AlreadySynced(_))
         ));
         assert_eq!(store.folders().unwrap().len(), 2);
@@ -382,7 +424,7 @@ mod tests {
     #[test]
     fn entries_round_trip() {
         let mut store = Store::open_in_memory().unwrap();
-        let f = store.add_folder(Path::new("/r")).unwrap();
+        let f = store.add_folder(Path::new("/r"), "r").unwrap();
         let mut gone = entry("old.txt");
         gone.mark_deleted(DeviceId([8; 32]));
         let saved = vec![entry("docs/é.txt"), gone];
@@ -401,7 +443,7 @@ mod tests {
     #[test]
     fn save_replaces_existing_entry() {
         let mut store = Store::open_in_memory().unwrap();
-        let f = store.add_folder(Path::new("/r")).unwrap();
+        let f = store.add_folder(Path::new("/r"), "r").unwrap();
         store.save_scan(f.id, &[entry("a")], 1).unwrap();
         let mut newer = entry("a");
         newer.size = 99;
@@ -410,12 +452,27 @@ mod tests {
     }
 
     #[test]
+    fn labels_are_unique_and_found() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .add_folder(Path::new("/home/me/a"), "homework")
+            .unwrap();
+        assert!(matches!(
+            store.add_folder(Path::new("/home/me/b"), "homework"),
+            Err(StoreError::LabelTaken(_))
+        ));
+        let f = store.folder_by_label("homework").unwrap().unwrap();
+        assert_eq!(f.root, Path::new("/home/me/a"));
+        assert!(store.folder_by_label("other").unwrap().is_none());
+    }
+
+    #[test]
     fn removing_folder_drops_its_manifest() {
         let mut store = Store::open_in_memory().unwrap();
-        let f = store.add_folder(Path::new("/r")).unwrap();
+        let f = store.add_folder(Path::new("/r"), "r").unwrap();
         store.save_scan(f.id, &[entry("a")], 1).unwrap();
         store.remove_folder(Path::new("/r")).unwrap();
-        let g = store.add_folder(Path::new("/r")).unwrap();
+        let g = store.add_folder(Path::new("/r"), "r").unwrap();
         assert!(store.files(g.id).unwrap().is_empty());
     }
 
@@ -507,7 +564,7 @@ mod tests {
         let db = dir.path().join("state.db");
         {
             let mut store = Store::open(&db).unwrap();
-            let f = store.add_folder(Path::new("/r")).unwrap();
+            let f = store.add_folder(Path::new("/r"), "r").unwrap();
             store.save_scan(f.id, &[entry("a")], 1).unwrap();
         }
         let store = Store::open(&db).unwrap();
