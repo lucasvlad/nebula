@@ -9,8 +9,11 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
 nebula-core = { version = "0.1.0", path = "../crates/nebula-core" }
 nebula-net = { version = "0.1.0", path = "../crates/nebula-net" }
+nebula-sync = { version = "0.1.0", path = "../crates/nebula-sync" }
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
 
 [lints]
@@ -18,3 +21,7 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[[bin]]
+name = "mitm-demo"
+path = "src/bin/mitm_demo.rs"

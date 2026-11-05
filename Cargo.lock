@@ -872,8 +872,11 @@ dependencies = [
 name = "nebula-tests"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
  "nebula-core",
  "nebula-net",
+ "nebula-sync",
  "tempfile",
  "tokio",
 ]
