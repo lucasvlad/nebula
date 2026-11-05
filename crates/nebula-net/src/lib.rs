@@ -4,4 +4,5 @@ pub mod discovery;
 pub mod frame;
 pub mod identity;
 pub mod pairing;
+pub mod sas;
 pub mod transport;
