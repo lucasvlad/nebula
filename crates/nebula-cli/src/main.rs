@@ -78,6 +78,9 @@ enum Command {
         /// How many pings to send.
         #[arg(short = 'c', long, default_value_t = 3)]
         count: u32,
+        /// Also send this text, encrypted, for the other device to display.
+        #[arg(short, long)]
+        message: Option<String>,
     },
 }
 
@@ -224,6 +227,7 @@ fn main() -> Result<()> {
             device,
             addr,
             count,
+            message,
         } => {
             let identity = identity(&home)?;
             let store = open_store(&home)?;
@@ -233,6 +237,7 @@ fn main() -> Result<()> {
                 device.as_deref(),
                 addr.as_deref(),
                 count,
+                message.as_deref(),
             ))?;
         }
     }

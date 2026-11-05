@@ -106,10 +106,11 @@ async fn serve(
         .and_then(|s| s.peer(&device).ok().flatten())
         .map_or_else(|| device.short(), |p| p.name);
     info!(
-        "encrypted session with \"{peer_name}\" ({}) from {addr}",
-        device.short()
+        "encrypted session with \"{peer_name}\" ({}) from {addr}; security code: {}",
+        device.short(),
+        session.security_code().to_string().to_uppercase()
     );
-    match answer(&mut session, &my_name).await {
+    match answer(&mut session, &my_name, &peer_name).await {
         Ok(()) => info!("\"{peer_name}\" disconnected"),
         Err(e) => warn!("session with \"{peer_name}\" ended: {e}"),
     }
@@ -119,6 +120,7 @@ async fn serve(
 async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
     session: &mut Session<S>,
     my_name: &str,
+    peer_name: &str,
 ) -> Result<()> {
     send(session, &hello(my_name)).await?;
     loop {
@@ -131,6 +133,10 @@ async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
             Message::Hello { protocol, .. } => check_protocol(protocol)?,
             Message::Ping { nonce } => send(session, &Message::Pong { nonce }).await?,
             Message::Pong { .. } => {}
+            Message::Note { text } => {
+                let text: String = text.chars().filter(|c| !c.is_control()).take(500).collect();
+                info!("\"{peer_name}\" sent a message, decrypted here: \"{text}\"");
+            }
         }
     }
 }
@@ -141,6 +147,7 @@ pub async fn ping(
     who: Option<&str>,
     addr: Option<&str>,
     count: u32,
+    message: Option<&str>,
 ) -> Result<()> {
     if store.peers()?.is_empty() {
         bail!("this device is not paired with anything yet. Pair first with `nebula pair`");
@@ -206,6 +213,16 @@ pub async fn ping(
     println!(
         "The connection is encrypted, and both devices proved they are paired with each other."
     );
+    println!();
+    pair::print_security_code(&session.security_code());
+    println!();
+    if let Some(text) = message {
+        let note = Message::Note {
+            text: text.to_string(),
+        };
+        send(&mut session, &note).await?;
+        println!("Sent \"{text}\" encrypted. The other device's log shows it decrypted.");
+    }
 
     for nonce in 0..u64::from(count) {
         let started = Instant::now();

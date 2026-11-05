@@ -33,6 +33,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::frame::{self, MAX_NOISE_FRAME};
 use crate::identity::{Identity, NOISE_PARAMS};
+use crate::sas::SecurityCode;
 
 /// Largest application message accepted by [`Session::send`] and
 /// [`Session::recv`].
@@ -73,6 +74,7 @@ pub struct Session<S> {
     stream: S,
     noise: snow::TransportState,
     remote: [u8; KEY_LEN],
+    code: SecurityCode,
     buf: Vec<u8>,
     broken: bool,
 }
@@ -131,7 +133,7 @@ where
         read_handshake(&mut stream, &mut hs, &mut buf).await?; // <- e, ee, s, es
         let remote = allowed_remote(&hs, is_allowed)?;
         write_handshake(&mut stream, &mut hs, &mut buf).await?; // -> s, se
-        let mut session = Session::new(stream, hs.into_transport_mode()?, remote, buf);
+        let mut session = Session::new(stream, hs, remote, buf)?;
         if !session.read_encrypted().await?.is_empty() {
             return Err(TransportError::Protocol("bad handshake confirmation"));
         }
@@ -142,7 +144,7 @@ where
         write_handshake(&mut stream, &mut hs, &mut buf).await?; // <- e, ee, s, es
         read_handshake(&mut stream, &mut hs, &mut buf).await?; // -> s, se
         let remote = allowed_remote(&hs, is_allowed)?;
-        let mut session = Session::new(stream, hs.into_transport_mode()?, remote, buf);
+        let mut session = Session::new(stream, hs, remote, buf)?;
         session.write_encrypted(&[]).await?;
         Ok(session)
     }
@@ -188,14 +190,27 @@ fn allowed_remote(
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
-    fn new(stream: S, noise: snow::TransportState, remote: [u8; KEY_LEN], buf: Vec<u8>) -> Self {
-        Self {
+    fn new(
+        stream: S,
+        hs: snow::HandshakeState,
+        remote: [u8; KEY_LEN],
+        buf: Vec<u8>,
+    ) -> Result<Self, TransportError> {
+        let code = SecurityCode::from_handshake_hash(hs.get_handshake_hash());
+        Ok(Self {
             stream,
-            noise,
+            noise: hs.into_transport_mode()?,
             remote,
+            code,
             buf,
             broken: false,
-        }
+        })
+    }
+
+    /// Four words derived from this session's handshake. They match on both
+    /// devices only if nobody is in the middle (see [`crate::sas`]).
+    pub fn security_code(&self) -> SecurityCode {
+        self.code
     }
 
     pub async fn send(&mut self, msg: &[u8]) -> Result<(), TransportError> {
@@ -432,6 +447,7 @@ mod tests {
         assert_eq!(sa.remote_device(), ib.device_id());
         assert_eq!(sb.remote_device(), ia.device_id());
         assert_eq!(sa.remote_static(), ib.public_key());
+        assert_eq!(sa.security_code(), sb.security_code(), "codes must match");
 
         sa.send(b"hello").await.unwrap();
         assert_eq!(sb.recv().await.unwrap(), b"hello");
@@ -566,6 +582,17 @@ mod tests {
         let (b, _keep_open) = tokio::io::duplex(1024);
         let res = accept(b, &ib, |_| true).await;
         assert!(matches!(res, Err(TransportError::HandshakeTimeout)));
+    }
+
+    #[tokio::test]
+    async fn each_session_gets_fresh_security_code() {
+        let (ia, ib) = ids();
+        let (a1, b1) = tokio::io::duplex(1 << 16);
+        let (a2, b2) = tokio::io::duplex(1 << 16);
+        let (s1, _) = pair_over(a1, b1, &ia, &ib).await;
+        let (s2, _) = pair_over(a2, b2, &ia, &ib).await;
+        // Fresh ephemeral keys every time, so the words change per session.
+        assert_ne!(s1.security_code(), s2.security_code());
     }
 
     #[tokio::test]

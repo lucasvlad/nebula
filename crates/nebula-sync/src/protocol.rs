@@ -20,6 +20,11 @@ pub enum Message {
     Pong {
         nonce: u64,
     },
+    /// A line of text for the other device to display. Used by
+    /// `nebula ping --message` to show encryption working in a demo.
+    Note {
+        text: String,
+    },
 }
 
 impl Message {
@@ -46,6 +51,9 @@ mod tests {
             },
             Message::Ping { nonce: 7 },
             Message::Pong { nonce: u64::MAX },
+            Message::Note {
+                text: "hello".into(),
+            },
         ] {
             assert_eq!(Message::decode(&m.encode()).unwrap(), m);
         }

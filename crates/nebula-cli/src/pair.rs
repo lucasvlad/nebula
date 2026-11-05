@@ -8,6 +8,7 @@ use nebula_core::DeviceId;
 use nebula_net::discovery::{self, ServiceKind};
 use nebula_net::identity::Identity;
 use nebula_net::pairing::{self, CODE_LIFETIME, MAX_ATTEMPTS, PairedPeer, PairingCode};
+use nebula_net::sas::SecurityCode;
 use nebula_sync::store::{Peer, Store};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
@@ -153,10 +154,22 @@ fn confirm(peer: &PairedPeer, my_name: &str, me: &DeviceId) {
         peer.device_id.short()
     );
     println!(
-        "The other device should say it paired with \"{my_name}\" (device {}). \
-         If the names or IDs don't match, run `nebula unpair` on both.",
+        "The other device should say it paired with \"{my_name}\" (device {}).",
         me.short()
     );
+    println!();
+    print_security_code(&peer.security_code);
+    println!(
+        "If they differ, someone may be in the middle: run `nebula unpair` on both \
+         and pair again."
+    );
+}
+
+/// The four words, set apart so they are easy to compare across screens.
+pub fn print_security_code(code: &SecurityCode) {
+    let words = code.words().map(str::to_uppercase);
+    println!("Security code:   {}", words.join("   "));
+    println!("Check that the other device shows the same four words.");
 }
 
 pub fn list(store: &Store) -> Result<()> {

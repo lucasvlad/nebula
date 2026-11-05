@@ -25,6 +25,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::frame::{read_frame, write_frame};
 use crate::identity::Identity;
+use crate::sas::SecurityCode;
 
 /// How long a code stays valid after `listen` starts.
 pub const CODE_LIFETIME: Duration = Duration::from_secs(120);
@@ -130,6 +131,8 @@ pub struct PairedPeer {
     pub public_key: [u8; 32],
     pub device_id: DeviceId,
     pub name: String,
+    /// Words both devices can compare on screen (see [`crate::sas`]).
+    pub security_code: SecurityCode,
 }
 
 /// Device A: accept connections on `listener` until one pairs successfully,
@@ -243,7 +246,7 @@ async fn run_listener<S: AsyncRead + AsyncWrite + Unpin>(
     // -> s, se + their name
     let msg = read_frame(&mut stream, MAX_HANDSHAKE_MSG).await?;
     let n = hs.read_message(&msg, &mut payload).map_err(read_error)?;
-    let peer = paired_peer(hs.get_remote_static(), &payload[..n])?;
+    let peer = paired_peer(&hs, &payload[..n])?;
 
     // Tell the joiner we accepted.
     let mut transport = hs.into_transport_mode()?;
@@ -277,9 +280,12 @@ async fn run_joiner<S: AsyncRead + AsyncWrite + Unpin>(
     // The PSK is mixed before this payload is decrypted, so success here
     // authenticates the listener's static key against the code.
     let n = hs.read_message(&msg, &mut payload).map_err(read_error)?;
-    let peer = paired_peer(hs.get_remote_static(), &payload[..n])?;
+    let mut peer = paired_peer(&hs, &payload[..n])?;
     let n = hs.write_message(my_name, &mut buf)?;
     write_frame(&mut stream, &buf[..n]).await?;
+    // The handshake is complete only after our last message, and the
+    // listener derives its code from the complete transcript too.
+    peer.security_code = SecurityCode::from_handshake_hash(hs.get_handshake_hash());
 
     let mut transport = hs.into_transport_mode()?;
     let msg = read_frame(&mut stream, MAX_HANDSHAKE_MSG).await?;
@@ -323,8 +329,9 @@ fn read_error(e: snow::Error) -> PairingError {
     }
 }
 
-fn paired_peer(remote_static: Option<&[u8]>, name: &[u8]) -> Result<PairedPeer, PairingError> {
-    let public_key: [u8; 32] = remote_static
+fn paired_peer(hs: &snow::HandshakeState, name: &[u8]) -> Result<PairedPeer, PairingError> {
+    let public_key: [u8; 32] = hs
+        .get_remote_static()
         .and_then(|k| k.try_into().ok())
         .ok_or_else(|| PairingError::Protocol("peer static key missing".into()))?;
     let name = std::str::from_utf8(name)
@@ -334,6 +341,7 @@ fn paired_peer(remote_static: Option<&[u8]>, name: &[u8]) -> Result<PairedPeer, 
         public_key,
         device_id: DeviceId::from_public_key(&public_key),
         name: name.to_owned(),
+        security_code: SecurityCode::from_handshake_hash(hs.get_handshake_hash()),
     })
 }
 
@@ -423,6 +431,7 @@ mod tests {
         assert_eq!(pb.public_key, *a.public_key());
         assert_eq!(pb.device_id, a.device_id());
         assert_eq!(pb.name, "alice-laptop");
+        assert_eq!(pa.security_code, pb.security_code, "codes must match");
     }
 
     #[tokio::test]
