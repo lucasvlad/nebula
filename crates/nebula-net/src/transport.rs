@@ -26,10 +26,12 @@
 //! or reordered frame fail to decrypt, and any failure ends the session.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nebula_core::DeviceId;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 
 use crate::frame::{self, MAX_NOISE_FRAME};
 use crate::identity::{Identity, NOISE_PARAMS};
@@ -37,7 +39,9 @@ use crate::sas::SecurityCode;
 
 /// Largest application message accepted by [`Session::send`] and
 /// [`Session::recv`].
-pub const MAX_MESSAGE: usize = 4 * 1024 * 1024;
+/// Large enough for the chunk list of a ~3.5 GB file (36 bytes per 8 KiB
+/// chunk), still small enough that a hostile peer cannot exhaust memory.
+pub const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
 /// A peer that has not finished the handshake by then is dropped.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -214,52 +218,56 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     }
 
     pub async fn send(&mut self, msg: &[u8]) -> Result<(), TransportError> {
-        if msg.len() > MAX_MESSAGE {
-            return Err(TransportError::MessageTooLarge(msg.len()));
-        }
-        self.guard()?;
+        check_len(msg)?;
+        guard(self.broken)?;
         self.broken = true;
-        let total =
-            u32::try_from(msg.len()).map_err(|_| TransportError::MessageTooLarge(msg.len()))?;
-        let (head, mut rest) = msg.split_at(msg.len().min(MAX_PLAINTEXT - LEN_PREFIX));
-        let mut first = Vec::with_capacity(LEN_PREFIX + head.len());
-        first.extend_from_slice(&total.to_be_bytes());
-        first.extend_from_slice(head);
-        self.write_encrypted(&first).await?;
-        while !rest.is_empty() {
-            let (part, tail) = rest.split_at(rest.len().min(MAX_PLAINTEXT));
-            self.write_encrypted(part).await?;
-            rest = tail;
-        }
+        let noise = &mut self.noise;
+        send_message(&mut self.stream, &mut self.buf, msg, &mut |p, out| {
+            Ok(noise.write_message(p, out)?)
+        })
+        .await?;
         self.broken = false;
         Ok(())
     }
 
     pub async fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
-        self.guard()?;
+        guard(self.broken)?;
         self.broken = true;
-        let first = self.read_encrypted().await?;
-        let (len, head) = first
-            .split_first_chunk::<LEN_PREFIX>()
-            .ok_or(TransportError::Protocol("message header too short"))?;
-        let total = u32::from_be_bytes(*len) as usize;
-        if total > MAX_MESSAGE {
-            return Err(TransportError::MessageTooLarge(total));
-        }
-        if head.len() > total {
-            return Err(TransportError::Protocol("message longer than its header"));
-        }
-        let mut msg = Vec::with_capacity(total);
-        msg.extend_from_slice(head);
-        while msg.len() < total {
-            let part = self.read_encrypted().await?;
-            if part.is_empty() || part.len() > total - msg.len() {
-                return Err(TransportError::Protocol("bad continuation frame"));
-            }
-            msg.extend_from_slice(part);
-        }
+        let noise = &mut self.noise;
+        let msg = recv_message(&mut self.stream, &mut self.buf, &mut |c, out| {
+            Ok(noise.read_message(c, out)?)
+        })
+        .await?;
         self.broken = false;
         Ok(msg)
+    }
+
+    /// Splits the session so one task can send while another receives.
+    /// The halves share the Noise state behind a lock that is held only to
+    /// encrypt or decrypt one frame, never across an `.await`. Each half
+    /// keeps the session's rules (limits, not cancel-safe), and an error on
+    /// either half closes both.
+    pub fn into_split(self) -> (SendHalf<S>, RecvHalf<S>) {
+        let (read, write) = tokio::io::split(self.stream);
+        let shared = Arc::new(Shared {
+            noise: Mutex::new(self.noise),
+            broken: AtomicBool::new(self.broken),
+        });
+        let recv = RecvHalf {
+            stream: read,
+            shared: shared.clone(),
+            remote: self.remote,
+            buf: self.buf,
+            busy: false,
+        };
+        let send = SendHalf {
+            stream: write,
+            shared,
+            remote: self.remote,
+            buf: vec![0u8; MAX_NOISE_FRAME],
+            busy: false,
+        };
+        (send, recv)
     }
 
     /// The peer's static public key, already checked against the allowlist.
@@ -271,26 +279,205 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         DeviceId::from_public_key(&self.remote)
     }
 
-    fn guard(&self) -> Result<(), TransportError> {
-        if self.broken {
-            Err(TransportError::Protocol(
-                "session closed after an earlier error",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
     async fn write_encrypted(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
-        let n = self.noise.write_message(plaintext, &mut self.buf)?;
-        Ok(frame::write_frame(&mut self.stream, &self.buf[..n]).await?)
+        let noise = &mut self.noise;
+        write_encrypted(&mut self.stream, &mut self.buf, plaintext, &mut |p, out| {
+            Ok(noise.write_message(p, out)?)
+        })
+        .await
     }
 
     async fn read_encrypted(&mut self) -> Result<&[u8], TransportError> {
-        let msg = frame::read_frame(&mut self.stream, MAX_NOISE_FRAME).await?;
-        let n = self.noise.read_message(&msg, &mut self.buf)?;
-        Ok(&self.buf[..n])
+        let noise = &mut self.noise;
+        read_encrypted(&mut self.stream, &mut self.buf, &mut |c, out| {
+            Ok(noise.read_message(c, out)?)
+        })
+        .await
     }
+}
+
+/// Noise state shared by the two halves of a split [`Session`].
+struct Shared {
+    noise: Mutex<snow::TransportState>,
+    /// Set when either half fails, so the other stops too.
+    broken: AtomicBool,
+}
+
+impl Shared {
+    fn guard(&self, busy: bool) -> Result<(), TransportError> {
+        guard(busy || self.broken.load(Ordering::SeqCst))
+    }
+
+    /// One encrypt or decrypt step under the lock.
+    fn crypt(
+        &self,
+        f: impl FnOnce(&mut snow::TransportState) -> Result<usize, snow::Error>,
+    ) -> Result<usize, TransportError> {
+        let mut noise = self
+            .noise
+            .lock()
+            .map_err(|_| TransportError::Protocol("session state poisoned"))?;
+        Ok(f(&mut noise)?)
+    }
+
+    fn finish<T>(&self, res: Result<T, TransportError>) -> Result<T, TransportError> {
+        if res.is_err() {
+            self.broken.store(true, Ordering::SeqCst);
+        }
+        res
+    }
+}
+
+/// The sending half of a split [`Session`].
+pub struct SendHalf<S> {
+    stream: WriteHalf<S>,
+    shared: Arc<Shared>,
+    remote: [u8; KEY_LEN],
+    buf: Vec<u8>,
+    /// Set while a send is in progress, so a cancelled one breaks the half.
+    busy: bool,
+}
+
+impl<S: AsyncWrite> SendHalf<S> {
+    pub async fn send(&mut self, msg: &[u8]) -> Result<(), TransportError> {
+        check_len(msg)?;
+        self.shared.guard(self.busy)?;
+        self.busy = true;
+        let shared = &self.shared;
+        let res = send_message(&mut self.stream, &mut self.buf, msg, &mut |p, out| {
+            shared.crypt(|n| n.write_message(p, out))
+        })
+        .await;
+        self.shared.finish(res)?;
+        self.busy = false;
+        Ok(())
+    }
+
+    pub fn remote_device(&self) -> DeviceId {
+        DeviceId::from_public_key(&self.remote)
+    }
+}
+
+/// The receiving half of a split [`Session`].
+pub struct RecvHalf<S> {
+    stream: ReadHalf<S>,
+    shared: Arc<Shared>,
+    remote: [u8; KEY_LEN],
+    buf: Vec<u8>,
+    /// Set while a receive is in progress, so a cancelled one breaks the half.
+    busy: bool,
+}
+
+impl<S: AsyncRead> RecvHalf<S> {
+    pub async fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
+        self.shared.guard(self.busy)?;
+        self.busy = true;
+        let shared = &self.shared;
+        let res = recv_message(&mut self.stream, &mut self.buf, &mut |c, out| {
+            shared.crypt(|n| n.read_message(c, out))
+        })
+        .await;
+        let msg = self.shared.finish(res)?;
+        self.busy = false;
+        Ok(msg)
+    }
+
+    pub fn remote_device(&self) -> DeviceId {
+        DeviceId::from_public_key(&self.remote)
+    }
+}
+
+fn guard(broken: bool) -> Result<(), TransportError> {
+    if broken {
+        Err(TransportError::Protocol(
+            "session closed after an earlier error",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_len(msg: &[u8]) -> Result<(), TransportError> {
+    if msg.len() > MAX_MESSAGE {
+        Err(TransportError::MessageTooLarge(msg.len()))
+    } else {
+        Ok(())
+    }
+}
+
+/// One encrypt (or decrypt) step: input in, bytes written to the buffer out.
+type Crypt<'a> = dyn FnMut(&[u8], &mut [u8]) -> Result<usize, TransportError> + Send + 'a;
+
+/// Sends `msg` as a first frame that starts with the total length, then
+/// continuation frames.
+async fn send_message<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    buf: &mut [u8],
+    msg: &[u8],
+    encrypt: &mut Crypt<'_>,
+) -> Result<(), TransportError> {
+    let total = u32::try_from(msg.len()).map_err(|_| TransportError::MessageTooLarge(msg.len()))?;
+    let (head, mut rest) = msg.split_at(msg.len().min(MAX_PLAINTEXT - LEN_PREFIX));
+    let mut first = Vec::with_capacity(LEN_PREFIX + head.len());
+    first.extend_from_slice(&total.to_be_bytes());
+    first.extend_from_slice(head);
+    write_encrypted(stream, buf, &first, encrypt).await?;
+    while !rest.is_empty() {
+        let (part, tail) = rest.split_at(rest.len().min(MAX_PLAINTEXT));
+        write_encrypted(stream, buf, part, encrypt).await?;
+        rest = tail;
+    }
+    Ok(())
+}
+
+/// Reads one message written by [`send_message`], rejecting any claimed
+/// length over [`MAX_MESSAGE`] before allocating.
+async fn recv_message<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    buf: &mut [u8],
+    decrypt: &mut Crypt<'_>,
+) -> Result<Vec<u8>, TransportError> {
+    let first = read_encrypted(stream, buf, decrypt).await?;
+    let (len, head) = first
+        .split_first_chunk::<LEN_PREFIX>()
+        .ok_or(TransportError::Protocol("message header too short"))?;
+    let total = u32::from_be_bytes(*len) as usize;
+    if total > MAX_MESSAGE {
+        return Err(TransportError::MessageTooLarge(total));
+    }
+    if head.len() > total {
+        return Err(TransportError::Protocol("message longer than its header"));
+    }
+    let mut msg = Vec::with_capacity(total);
+    msg.extend_from_slice(head);
+    while msg.len() < total {
+        let part = read_encrypted(stream, buf, decrypt).await?;
+        if part.is_empty() || part.len() > total - msg.len() {
+            return Err(TransportError::Protocol("bad continuation frame"));
+        }
+        msg.extend_from_slice(part);
+    }
+    Ok(msg)
+}
+
+async fn write_encrypted<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    buf: &mut [u8],
+    plaintext: &[u8],
+    encrypt: &mut Crypt<'_>,
+) -> Result<(), TransportError> {
+    let n = encrypt(plaintext, buf)?;
+    Ok(frame::write_frame(stream, &buf[..n]).await?)
+}
+
+async fn read_encrypted<'b, R: AsyncRead + Unpin>(
+    stream: &mut R,
+    buf: &'b mut [u8],
+    decrypt: &mut Crypt<'_>,
+) -> Result<&'b [u8], TransportError> {
+    let msg = frame::read_frame(stream, MAX_NOISE_FRAME).await?;
+    let n = decrypt(&msg, buf)?;
+    Ok(&buf[..n])
 }
 
 impl<S> fmt::Debug for Session<S> {
@@ -593,6 +780,100 @@ mod tests {
         let (s2, _) = pair_over(a2, b2, &ia, &ib).await;
         // Fresh ephemeral keys every time, so the words change per session.
         assert_ne!(s1.security_code(), s2.security_code());
+    }
+
+    /// Both directions at once, from separate tasks, with messages that
+    /// span many frames, so frames from the two directions interleave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn split_halves_work_concurrently_both_ways() {
+        let (ia, ib) = ids();
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (sa, sb) = pair_over(a, b, &ia, &ib).await;
+        assert_eq!(sa.security_code(), sb.security_code());
+        let (mut a_tx, mut a_rx) = sa.into_split();
+        let (mut b_tx, mut b_rx) = sb.into_split();
+        assert_eq!(a_tx.remote_device(), ib.device_id());
+        assert_eq!(b_rx.remote_device(), ia.device_id());
+
+        let sizes = [0, 10, MAX_PLAINTEXT, 1 << 20, 3 << 20];
+        let msgs: Vec<Vec<u8>> = sizes.iter().map(|&n| noise_bytes(n)).collect();
+        let (m1, m2, m3, m4) = (msgs.clone(), msgs.clone(), msgs.clone(), msgs);
+        let tasks = [
+            tokio::spawn(async move {
+                for m in &m1 {
+                    a_tx.send(m).await.unwrap();
+                }
+            }),
+            tokio::spawn(async move {
+                for m in m2.iter().rev() {
+                    b_tx.send(m).await.unwrap();
+                }
+            }),
+            tokio::spawn(async move {
+                for m in &m3 {
+                    assert_eq!(&b_rx.recv().await.unwrap(), m);
+                }
+            }),
+            tokio::spawn(async move {
+                for m in m4.iter().rev() {
+                    assert_eq!(&a_rx.recv().await.unwrap(), m);
+                }
+            }),
+        ];
+        for t in tasks {
+            t.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn split_detects_tampering_and_closes_both_halves() {
+        let (ia, ib) = ids();
+        let (a, b, ta, _) = tapped_pipe();
+        let (sa, sb) = pair_over(a, b, &ia, &ib).await;
+        let (mut a_tx, _a_rx) = sa.into_split();
+        let (mut b_tx, mut b_rx) = sb.into_split();
+        ta.flip_after(10);
+        a_tx.send(b"some file metadata").await.unwrap();
+        assert!(matches!(b_rx.recv().await, Err(TransportError::Noise(_))));
+        assert!(matches!(
+            b_rx.recv().await,
+            Err(TransportError::Protocol(_))
+        ));
+        assert!(matches!(
+            b_tx.send(b"x").await,
+            Err(TransportError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn split_oversized_send_is_rejected_and_session_survives() {
+        let (ia, ib) = ids();
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (sa, mut sb) = pair_over(a, b, &ia, &ib).await;
+        let (mut a_tx, _a_rx) = sa.into_split();
+        let big = vec![0u8; MAX_MESSAGE + 1];
+        assert!(matches!(
+            a_tx.send(&big).await,
+            Err(TransportError::MessageTooLarge(_))
+        ));
+        a_tx.send(b"still fine").await.unwrap();
+        assert_eq!(sb.recv().await.unwrap(), b"still fine");
+    }
+
+    #[tokio::test]
+    async fn dropping_one_half_leaves_the_other_working() {
+        let (ia, ib) = ids();
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (sa, sb) = pair_over(a, b, &ia, &ib).await;
+        let (a_tx, mut a_rx) = sa.into_split();
+        let (mut b_tx, b_rx) = sb.into_split();
+        drop(a_tx);
+        drop(b_rx);
+        b_tx.send(b"after drop").await.unwrap();
+        assert_eq!(a_rx.recv().await.unwrap(), b"after drop");
+        // Once the peer is gone entirely, recv reports it instead of panicking.
+        drop(b_tx);
+        assert!(matches!(a_rx.recv().await, Err(TransportError::Io(_))));
     }
 
     #[tokio::test]

@@ -1,145 +1,21 @@
-//! `nebula run` accepts encrypted sessions from paired devices; `nebula ping`
-//! opens one and measures the round trip. Syncing over these sessions
-//! comes in M3.
+//! `nebula ping` opens an encrypted session to a running daemon and measures
+//! the round trip, plus helpers shared with the daemon (`crate::daemon`).
 
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
-use nebula_net::discovery::{self, ServiceKind};
+use anyhow::{Result, anyhow, bail};
+use nebula_net::discovery;
 use nebula_net::identity::Identity;
 use nebula_net::transport::{self, Session, TransportError};
 use nebula_sync::protocol::{Message, PROTOCOL_VERSION};
 use nebula_sync::store::Store;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, warn};
 
 use crate::pair;
 
 /// Port `nebula run` listens on.
 pub const RUN_PORT: u16 = 7878;
 const FIND_TIME: Duration = Duration::from_secs(4);
-
-pub async fn run(identity: Identity, store: Store, port: u16) -> Result<()> {
-    let me = identity.device_id();
-    let name = pair::device_name(&store)?;
-    let listener = TcpListener::bind(("0.0.0.0", port))
-        .await
-        .with_context(|| format!("could not listen on port {port}; is Nebula already running?"))?;
-    let _advert = match discovery::advertise(ServiceKind::Sync, &me, port) {
-        Ok(a) => Some(a),
-        Err(e) => {
-            warn!("could not announce on the local network ({e}); peers will need --addr");
-            None
-        }
-    };
-    let peers = store.peers()?.len();
-    println!(
-        "Nebula is running as \"{name}\" (device {}) on port {port}, with {peers} paired device{}.",
-        me.short(),
-        if peers == 1 { "" } else { "s" }
-    );
-    if let Some(ip) = pair::local_ips().first() {
-        println!(
-            "Other devices can reach it at {}.",
-            SocketAddr::new(*ip, port)
-        );
-    }
-    println!("Press Ctrl+C to stop.");
-
-    let identity = Arc::new(identity);
-    let store = Arc::new(Mutex::new(store));
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("Stopping.");
-                return Ok(());
-            }
-            accepted = listener.accept() => {
-                let (stream, addr) = accepted?;
-                tokio::spawn(serve(stream, addr, identity.clone(), store.clone(), name.clone()));
-            }
-        }
-    }
-}
-
-async fn serve(
-    stream: TcpStream,
-    addr: SocketAddr,
-    identity: Arc<Identity>,
-    store: Arc<Mutex<Store>>,
-    my_name: String,
-) {
-    let allowed = |key: &[u8; 32]| {
-        store
-            .lock()
-            .map(|s| s.is_paired(key).unwrap_or(false))
-            .unwrap_or(false)
-    };
-    let mut session = match transport::accept(stream, &identity, allowed).await {
-        Ok(s) => s,
-        Err(TransportError::NotAllowed(device)) => {
-            warn!(
-                "refused a connection from {addr}: device {} is not paired with this one",
-                device.short()
-            );
-            return;
-        }
-        Err(TransportError::Io(e)) if is_closed(&e) => {
-            info!(
-                "{addr} hung up during the secure handshake \
-                 (probably a device that is not paired with this one)"
-            );
-            return;
-        }
-        Err(e) => {
-            warn!("connection from {addr} failed during the secure handshake: {e}");
-            return;
-        }
-    };
-    let device = session.remote_device();
-    let peer_name = store
-        .lock()
-        .ok()
-        .and_then(|s| s.peer(&device).ok().flatten())
-        .map_or_else(|| device.short(), |p| p.name);
-    info!(
-        "encrypted session with \"{peer_name}\" ({}) from {addr}; security code: {}",
-        device.short(),
-        session.security_code().to_string().to_uppercase()
-    );
-    match answer(&mut session, &my_name, &peer_name).await {
-        Ok(()) => info!("\"{peer_name}\" disconnected"),
-        Err(e) => warn!("session with \"{peer_name}\" ended: {e}"),
-    }
-}
-
-/// Says hello, then answers pings until the peer hangs up.
-async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
-    session: &mut Session<S>,
-    my_name: &str,
-    peer_name: &str,
-) -> Result<()> {
-    send(session, &hello(my_name)).await?;
-    loop {
-        let msg = match recv(session).await {
-            Ok(m) => m,
-            Err(e) if is_hangup(&e) => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        match msg {
-            Message::Hello { protocol, .. } => check_protocol(protocol)?,
-            Message::Ping { nonce } => send(session, &Message::Pong { nonce }).await?,
-            Message::Pong { .. } => {}
-            Message::Note { text } => {
-                let text: String = text.chars().filter(|c| !c.is_control()).take(500).collect();
-                info!("\"{peer_name}\" sent a message, decrypted here: \"{text}\"");
-            }
-        }
-    }
-}
 
 pub async fn ping(
     identity: Identity,
@@ -197,7 +73,9 @@ pub async fn ping(
         .await
         .map_err(|e| explain_refusal(e, target.is_some()))?;
     let device = session.remote_device();
-    send(&mut session, &hello(&pair::device_name(&store)?)).await?;
+    // We do not say Hello: a session that opens with Ping or Note is a ping
+    // session to the daemon, answered but kept apart from syncing, so it
+    // cannot displace this device's own daemon's sync session.
     match recv(&mut session).await? {
         Message::Hello { protocol, .. } => check_protocol(protocol)?,
         other => bail!("peer did not say hello first: {other:?}"),
@@ -246,14 +124,14 @@ pub async fn ping(
     Ok(())
 }
 
-fn hello(name: &str) -> Message {
+pub(crate) fn hello(name: &str) -> Message {
     Message::Hello {
         name: name.to_string(),
         protocol: PROTOCOL_VERSION,
     }
 }
 
-fn check_protocol(theirs: u32) -> Result<()> {
+pub(crate) fn check_protocol(theirs: u32) -> Result<()> {
     if theirs != PROTOCOL_VERSION {
         bail!(
             "the other device speaks protocol version {theirs}, this one {PROTOCOL_VERSION}; \
@@ -273,14 +151,14 @@ async fn recv<S: AsyncRead + AsyncWrite + Unpin>(s: &mut Session<S>) -> Result<M
     Message::decode(&bytes).map_err(|e| anyhow!("peer sent a malformed message: {e}"))
 }
 
-fn is_closed(e: &std::io::Error) -> bool {
+pub(crate) fn is_closed(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
         std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
     )
 }
 
-fn is_hangup(e: &anyhow::Error) -> bool {
+pub(crate) fn is_hangup(e: &anyhow::Error) -> bool {
     matches!(e.downcast_ref::<TransportError>(), Some(TransportError::Io(io)) if is_closed(io))
 }
 
