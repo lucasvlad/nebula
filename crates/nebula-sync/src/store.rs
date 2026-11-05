@@ -203,6 +203,19 @@ impl Store {
         Ok(out)
     }
 
+    /// One manifest entry, if the folder has one for `path`.
+    pub fn file(&self, folder_id: i64, path: &RelPath) -> Result<Option<FileEntry>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT path, size, mtime_ns, content_hash, chunks, version, modified_by, deleted
+             FROM files WHERE folder_id = ?1 AND path = ?2",
+        )?;
+        let mut rows = stmt.query(params![folder_id, path.as_str()])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(entry_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Writes the result of a scan in one transaction: either every change
     /// lands, or none do.
     pub fn save_scan(

@@ -859,8 +859,10 @@ dependencies = [
 name = "nebula-sync"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "nebula-core",
  "postcard",
+ "proptest",
  "rusqlite",
  "serde",
  "tempfile",
