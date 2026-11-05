@@ -11,7 +11,9 @@ pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
-    /// First message on every session, from both sides.
+    /// First message from a daemon on every session. One-off clients such as
+    /// `nebula ping` wait for the daemon's Hello and do not send their own,
+    /// so they are never mistaken for a sync session.
     Hello {
         name: String,
         protocol: u32,

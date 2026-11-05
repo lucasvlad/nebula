@@ -38,6 +38,8 @@ use session::Registry;
 
 /// How often to rescan everything and check for added or removed folders.
 const TICK: Duration = Duration::from_secs(30);
+/// How often to check for devices unpaired while the daemon runs.
+const REVOKE_CHECK: Duration = Duration::from_secs(5);
 /// How long to let the engine finish its current step when stopping.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
@@ -115,6 +117,7 @@ pub async fn run(
     let connector = tokio::spawn(connector::run(daemon.clone(), connect));
 
     let mut ticks = tokio::time::interval(TICK);
+    let mut revocations = tokio::time::interval(REVOKE_CHECK);
     let mut watched: Option<Vec<(i64, PathBuf)>> = None;
     let mut watching: Option<FolderWatcher> = None;
     let result = loop {
@@ -137,6 +140,18 @@ pub async fn run(
             _ = ticks.tick() => {
                 refreshwatching(&daemon, &mut watched, &mut watching);
                 daemon.engine.send(Input::Tick);
+            }
+            _ = revocations.tick() => {
+                let paired: Vec<DeviceId> = match daemon.store().peers() {
+                    Ok(peers) => peers.into_iter().map(|p| p.device_id).collect(),
+                    Err(e) => {
+                        warn!("could not read the paired device list: {e}");
+                        continue;
+                    }
+                };
+                for peer in daemon.sessions.drop_unpaired(&paired, &daemon.engine) {
+                    info!("closed the session with {}: it was unpaired", peer.short());
+                }
             }
         }
     };

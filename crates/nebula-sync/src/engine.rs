@@ -652,7 +652,14 @@ impl Engine {
         self.store
             .put_files(d.folder.id, std::slice::from_ref(&entry))?;
         self.locators.remove(&d.folder.id);
-        info!("{path}: updated from the other device");
+        if d.base
+            .as_ref()
+            .is_some_and(|b| !b.deleted && b.content_hash == entry.content_hash)
+        {
+            debug!("{path}: already identical; recorded the other device's version history");
+        } else {
+            info!("{path}: updated from the other device");
+        }
         if d.loser_copy.is_some() {
             // Index the conflict copy so it syncs too.
             self.rescan(d.folder.id)?;

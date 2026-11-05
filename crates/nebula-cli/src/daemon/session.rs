@@ -76,6 +76,22 @@ impl Registry {
         self.lock().clear();
     }
 
+    /// Ends sessions with devices that are no longer paired, so `nebula
+    /// unpair` takes effect on a running daemon too. Returns who was cut off.
+    pub fn drop_unpaired(&self, paired: &[DeviceId], engine: &EngineHandle) -> Vec<DeviceId> {
+        let mut map = self.lock();
+        let gone: Vec<DeviceId> = map
+            .keys()
+            .filter(|d| !paired.contains(d))
+            .copied()
+            .collect();
+        for peer in &gone {
+            map.remove(peer);
+            engine.send(Input::Disconnected { peer: *peer });
+        }
+        gone
+    }
+
     /// Registers a session unless a better one exists. Engine inputs are sent
     /// under the lock, so they are queued in the order sessions change.
     fn register(&self, peer: DeviceId, live: Live, engine: &EngineHandle) -> bool {

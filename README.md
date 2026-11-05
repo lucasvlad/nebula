@@ -41,14 +41,26 @@ Pairing and connecting (run each half on a different device):
 nebula pair                       # device A: shows a code like 123-456
 nebula pair 123-456               # device B: finds A on the network and pairs
 nebula peers                      # list paired devices
-nebula run                        # accept encrypted connections from paired devices
+nebula run                        # keep synced folders in sync with paired devices
 nebula ping                       # from the other device: connect and time round trips
 nebula unpair <name>              # revoke a device
 ```
 
+To sync a folder, add it on both devices under the same name, then leave
+`nebula run` running on both:
+
+```sh
+nebula add ~/Documents/Homework --as homework     # on each device
+nebula run                                        # on each device
+```
+
+Changes sync within a few seconds. If both devices edit the same file while
+apart, the newer edit keeps the name and the other is saved next to it as
+`name (conflict copy <device> <time>).ext`. Nothing is silently lost.
+
 If the network blocks discovery (common on campus Wi-Fi), add
-`--addr <ip>[:port]` to `pair` and `ping`. `nebula pair` and `nebula run`
-print the address to use.
+`--addr <ip>[:port]` to `pair` and `ping`, and `--connect <ip>[:port]` to `run`.
+`nebula pair` and `nebula run` print the address to use.
 
 State lives in the OS data directory. Pass `--home <dir>` or set
 `NEBULA_HOME` to use another one (handy for running two devices on one machine).

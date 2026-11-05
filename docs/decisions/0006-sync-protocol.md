@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-11-04
-- **Milestone / PR:** M3–M4 / #?
+- **Milestone / PR:** M3–M4 / #8
 
 ## Context
 
