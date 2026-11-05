@@ -334,7 +334,8 @@ async fn simulate(no_pause: bool) -> Result<()> {
         Err(TransportError::NotAllowed(id)) => println!(
             "{}",
             green(&format!(
-                "Alice refused: the device that answered ({id}) is not the one she paired with."
+                "Alice refused: the device that answered (device {}) is not the one she paired with.",
+                id.short()
             ))
         ),
         other => bail!("Alice should have refused, got {other:?}"),
@@ -343,7 +344,8 @@ async fn simulate(no_pause: bool) -> Result<()> {
         Err(TransportError::NotAllowed(id)) => println!(
             "{}",
             green(&format!(
-                "Bob refused: the device that connected ({id}) is not the one he paired with."
+                "Bob refused: the device that connected (device {}) is not the one he paired with.",
+                id.short()
             ))
         ),
         other => bail!("Bob should have refused, got {other:?}"),
@@ -472,7 +474,7 @@ async fn impersonate(listen: &str, to: &str) -> Result<()> {
     match a {
         Ok(s) => println!(
             "Client side: it accepted Mallory. It presented device {}. {}",
-            s.remote_device(),
+            s.remote_device().short(),
             red("Mallory could now read what it sends.")
         ),
         Err(e) => println!(

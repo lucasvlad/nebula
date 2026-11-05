@@ -13,7 +13,10 @@ PORT_SNOOP=17900
 PORT_IMP=17901
 MESSAGE="Meet at the library at 7. My locker code is 4821."
 
-bold() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
+bold() {
+  if [[ -n "${NO_COLOR:-}" ]]; then printf '\n== %s ==\n' "$*"
+  else printf '\n\033[1m== %s ==\033[0m\n' "$*"; fi
+}
 pause() {
   [[ $NO_PAUSE -eq 1 ]] && return 0
   read -r -p $'\nPress Enter to continue...' _

@@ -141,7 +141,8 @@ pub fn contains_text(hay: &[u8], needle: &str) -> bool {
 
 /// Print "Readable text found: ..." for captured bytes.
 pub fn report_readable(bytes: &[u8]) {
-    let runs = readable_runs(bytes, 5);
+    // Random bytes produce short letter runs by chance; 8+ is meaningful.
+    let runs = readable_runs(bytes, 8);
     if runs.is_empty() {
         println!("  Readable text found: {}", green("none"));
     } else {

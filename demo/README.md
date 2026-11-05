@@ -48,5 +48,6 @@ nebula ping --addr 127.0.0.1:17900 -c 1 --message "My locker code is 4821."
 mitm-demo impersonate --listen 127.0.0.1:17901 --to 127.0.0.1:17978
 ```
 
-Note: in `snoop` output, a short readable-looking run (like `G6ge3`) can appear by chance in
-random-looking bytes. The demo lists them honestly instead of hiding them.
+Note: encrypted bytes look random, and random bytes contain short letter runs by chance
+(like `G6ge3`). The readable-text check therefore only reports runs of 8 or more
+characters, and any it finds are listed rather than hidden.
