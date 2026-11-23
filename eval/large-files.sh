@@ -34,9 +34,14 @@ setup() {
   "$N" --home "$WORK/b" name "Receiver" >/dev/null
   "$N" --home "$WORK/a" pair --port 17979 >"$WORK/pair.log" 2>&1 &
   local pp=$!
-  sleep 1
-  local code
-  code=$(grep "Pairing code" "$WORK/pair.log" | awk '{print $3}')
+  # Poll for the code: a fixed sleep is too short on a slow or busy machine.
+  local code="" _
+  for _ in $(seq 1 50); do
+    code=$(grep "Pairing code:" "$WORK/pair.log" 2>/dev/null | awk '{print $3}' || true)
+    [[ -n "$code" ]] && break
+    sleep 0.2
+  done
+  [[ -n "$code" ]] || { echo "could not read the pairing code" >&2; cat "$WORK/pair.log" >&2; exit 1; }
   "$N" --home "$WORK/b" pair "$code" --addr 127.0.0.1:17979 >/dev/null 2>&1
   wait "$pp" || true
   "$N" --home "$WORK/a" add "$WORK/fa" --as eval >/dev/null
@@ -48,7 +53,11 @@ start_a() {
   A_PID=$!
   PIDS+=("$A_PID")
   # Wait until A has indexed the file.
-  until grep -q "added" "$WORK/a.log" 2>/dev/null; do sleep 0.2; done
+  local deadline=$((SECONDS + 600))
+  until grep -q "added" "$WORK/a.log" 2>/dev/null; do
+    ((SECONDS < deadline)) || { echo "the sender did not index the file" >&2; cat "$WORK/a.log" >&2; exit 1; }
+    sleep 0.2
+  done
 }
 
 start_b() {
@@ -60,10 +69,11 @@ start_b() {
 # Waits until B reports the file installed, then checks it byte-for-byte.
 # Tracks peak memory. Sets ELAPSED, PEAK_A, PEAK_B.
 wait_synced() {
-  local start=$1 peak_a=0 peak_b=0 r
+  local start=$1 peak_a=0 peak_b=0 r deadline=$((SECONDS + 1800))
   # Polling the log instead of comparing 1 GB files keeps the measurement
   # from competing with the transfer for disk bandwidth.
   until grep -q "data.bin: updated from the other device" "$WORK/b.log" 2>/dev/null; do
+    ((SECONDS < deadline)) || { echo "the receiver did not finish within 30 minutes" >&2; tail -20 "$WORK/b.log" >&2; exit 1; }
     r=$(rss_kib "$A_PID"); ((r > peak_a)) && peak_a=$r
     r=$(rss_kib "$B_PID"); ((r > peak_b)) && peak_b=$r
     sleep 0.1
@@ -109,15 +119,33 @@ head -c "$total" /dev/urandom >"$WORK/fa/data.bin"
 : >"$WORK/b.log"
 start_a
 start_b
+# Size of the receiver's in-progress download (0 if none). Matches on the
+# temp-file prefix only, so it does not depend on how the rest is named.
+# `wc -c` rather than `stat`, whose flags differ between macOS and Linux.
+partial_size() {
+  local f
+  f=$(find "$WORK/fb" -name '.nebula-tmp-*' -type f 2>/dev/null | head -1)
+  if [[ -n "$f" ]]; then wc -c <"$f" 2>/dev/null | tr -d ' ' || echo 0; else echo 0; fi
+}
 partial=0
+deadline=$((SECONDS + 600))
 while ((partial < total / 2)); do
-  partial=$(find "$WORK/fb" -name '.nebula-tmp-*' -exec stat -f %z {} \; 2>/dev/null | head -1)
+  if [[ -e "$WORK/fb/data.bin" ]]; then
+    stop
+    echo
+    echo "## Resume after the receiver is killed mid-transfer"
+    echo
+    echo "- Skipped: the ${mib} MiB file finished before it could be interrupted; use a larger size."
+    exit 0
+  fi
+  ((SECONDS < deadline)) || { echo "the transfer did not reach half way within 10 minutes" >&2; exit 1; }
+  partial=$(partial_size)
   partial=${partial:-0}
   sleep 0.05
 done
 kill -9 "$B_PID"
 wait "$B_PID" 2>/dev/null || true
-kept=$(find "$WORK/fb" -name '.nebula-tmp-*' -exec stat -f %z {} \; | head -1)
+kept=$(partial_size)
 t0=$(now)
 start_b
 wait_synced "$t0"

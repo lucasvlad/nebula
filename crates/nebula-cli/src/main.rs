@@ -41,17 +41,25 @@ enum Command {
         #[arg(long = "as", value_name = "NAME")]
         label: Option<String>,
     },
-    /// Stop syncing a folder. Its files are left untouched.
-    Remove { folder: PathBuf },
+    /// Stop syncing a folder, by path or name. Its files are left untouched.
+    Remove {
+        #[arg(value_name = "PATH|NAME")]
+        folder: PathBuf,
+    },
     /// List synced folders.
     Folders,
     /// Look for changes in synced folders and record them.
     Scan {
-        /// Only this folder (default: all of them).
+        /// Only this folder, by path or name (default: all of them).
+        #[arg(value_name = "PATH|NAME")]
         folder: Option<PathBuf>,
     },
     /// Show what Nebula knows about the files in a synced folder.
-    Ls { folder: PathBuf },
+    Ls {
+        /// The folder's path or name.
+        #[arg(value_name = "PATH|NAME")]
+        folder: PathBuf,
+    },
     /// Pair with another device. Run with no code to show one, then run
     /// `nebula pair <code>` on the other device.
     Pair {
@@ -115,14 +123,15 @@ fn main() -> Result<()> {
         Command::Add { folder, label } => add(&home, &folder, label.as_deref())?,
         Command::Remove { folder } => {
             let store = open_store(&home)?;
-            let root = std::fs::canonicalize(&folder).unwrap_or(folder);
-            if store.remove_folder(&root)? {
+            let f = find_folder(&store, &folder)?;
+            if store.remove_folder(&f.root)? {
                 println!(
-                    "Stopped syncing {}. Its files were not touched.",
-                    root.display()
+                    "Stopped syncing {} (\"{}\"). Its files were not touched.",
+                    f.root.display(),
+                    f.label
                 );
             } else {
-                bail!("{} is not a synced folder", root.display());
+                bail!("{} is not a synced folder", f.root.display());
             }
         }
         Command::Folders => {
@@ -149,12 +158,25 @@ fn main() -> Result<()> {
             if folders.is_empty() {
                 println!("No synced folders. Add one with `nebula add <folder>`.");
             }
+            // One missing folder (an unplugged drive) must not stop the rest
+            // from being scanned.
+            let mut failed = 0;
             for f in folders {
                 println!("Scanning {}", tilde(&f.root));
                 let started = Instant::now();
-                let report = scanner::scan(&mut store, &f, device)
-                    .with_context(|| format!("scanning {}", f.root.display()))?;
-                print_report(&report, started.elapsed(), cli.verbose > 0);
+                match scanner::scan(&mut store, &f, device) {
+                    Ok(report) => print_report(&report, started.elapsed(), cli.verbose > 0),
+                    Err(e) => {
+                        eprintln!("Error: could not scan {}: {e}", f.root.display());
+                        failed += 1;
+                    }
+                }
+            }
+            if failed > 0 {
+                bail!(
+                    "{failed} folder{} could not be scanned",
+                    if failed == 1 { "" } else { "s" }
+                );
             }
         }
         Command::Ls { folder } => {
@@ -318,11 +340,64 @@ fn add(home: &Path, folder: &Path, label: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Finds a synced folder by name, or by path. The path may be relative, and
+/// the folder may no longer exist (it was deleted, or is on an unplugged
+/// drive), so it cannot simply be canonicalised.
 fn find_folder(store: &Store, folder: &Path) -> Result<Folder> {
-    let root = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
-    store
-        .folder(&root)?
-        .with_context(|| format!("{} is not a synced folder", root.display()))
+    if let Some(f) = folder
+        .to_str()
+        .map(|l| store.folder_by_label(l))
+        .transpose()?
+        .flatten()
+    {
+        return Ok(f);
+    }
+    if let Ok(root) = std::fs::canonicalize(folder)
+        && let Some(f) = store.folder(&root)?
+    {
+        return Ok(f);
+    }
+    let absolute = std::path::absolute(folder).unwrap_or_else(|_| folder.to_path_buf());
+    let mut wanted = vec![absolute.clone()];
+    wanted.extend(canonical_prefix(&absolute));
+    let wanted: Vec<PathBuf> = wanted.iter().map(|p| strip_verbatim(p)).collect();
+    for f in store.folders()? {
+        if wanted.contains(&strip_verbatim(&f.root)) {
+            return Ok(f);
+        }
+    }
+    bail!(
+        "{} is not a synced folder (see `nebula folders`)",
+        folder.display()
+    )
+}
+
+/// `path` with its deepest existing ancestor canonicalised, so a deleted
+/// folder under a symlinked parent (macOS `/var` is `/private/var`) still
+/// matches the canonical root `nebula add` stored.
+fn canonical_prefix(path: &Path) -> Option<PathBuf> {
+    let mut rest = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(mut base) = std::fs::canonicalize(cur) {
+            base.extend(rest.iter().rev());
+            return Some(base);
+        }
+        rest.push(cur.file_name()?);
+        cur = cur.parent()?;
+    }
+}
+
+/// Drops Windows' `\\?\` prefix, which `canonicalize` adds and
+/// `absolute` does not, so the two spellings compare equal.
+fn strip_verbatim(p: &Path) -> PathBuf {
+    match p.to_str() {
+        Some(s) => match s.strip_prefix(r"\\?\UNC\") {
+            Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+            None => PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(s)),
+        },
+        None => p.to_path_buf(),
+    }
 }
 
 fn print_report(r: &ScanReport, took: Duration, show_all: bool) {
@@ -473,6 +548,30 @@ mod tests {
         assert_eq!(group(999), "999");
         assert_eq!(group(12_203), "12,203");
         assert_eq!(group(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn strips_windows_verbatim_prefix() {
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\Users\me\docs")),
+            Path::new(r"C:\Users\me\docs")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\UNC\server\share")),
+            Path::new(r"\\server\share")
+        );
+        assert_eq!(strip_verbatim(Path::new("/home/me")), Path::new("/home/me"));
+    }
+
+    #[test]
+    fn canonical_prefix_of_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone").join("deeper");
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(
+            canonical_prefix(&gone),
+            Some(base.join("gone").join("deeper"))
+        );
     }
 
     #[test]
