@@ -19,7 +19,7 @@
 //! collide by case with a local file are skipped, and chunk requests are only
 //! answered from the named folder's own manifest.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -42,6 +42,10 @@ use crate::store::{Folder, Store, StoreError};
 const WINDOW: usize = 32;
 /// Index messages are split so each stays well under the transport limit.
 const INDEX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// Downloads with an open temp file at once. Each holds a file descriptor,
+/// and macOS allows only 256 per process by default; more decisions wait
+/// in a queue.
+pub const MAX_ACTIVE_DOWNLOADS: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -118,9 +122,72 @@ struct Download {
     received: HashMap<usize, Vec<u8>>,
 }
 
+/// A download that has been decided but waits for a free slot. Its temp
+/// file is opened only when it starts.
+struct Queued {
+    folder: Folder,
+    from: DeviceId,
+    base: Option<FileEntry>,
+    want: FileEntry,
+    loser_copy: Option<RelPath>,
+}
+
 struct PendingRequest {
     key: FileKey,
     index: usize,
+}
+
+/// Lowercased spelling -> (local spelling, live files using it) for every
+/// live local file path and each of its directory prefixes. A remote path
+/// that matches any of these case-insensitively but is spelled differently
+/// would land inside the local file or directory on macOS or Windows.
+#[derive(Default)]
+struct Cases(HashMap<String, (String, usize)>);
+
+impl Cases {
+    fn add(&mut self, path: &RelPath) {
+        for p in prefixes(path.as_str()) {
+            let e = self
+                .0
+                .entry(p.to_lowercase())
+                .or_insert_with(|| (p.to_string(), 0));
+            if e.0 == p {
+                e.1 += 1;
+            }
+        }
+    }
+
+    fn remove(&mut self, path: &RelPath) {
+        for p in prefixes(path.as_str()) {
+            let k = p.to_lowercase();
+            if let Some(e) = self.0.get_mut(&k)
+                && e.0 == p
+            {
+                e.1 -= 1;
+                if e.1 == 0 {
+                    self.0.remove(&k);
+                }
+            }
+        }
+    }
+
+    /// The differently spelled local file or directory `path` would
+    /// collide with, if any.
+    fn clash(&self, path: &RelPath) -> Option<&str> {
+        prefixes(path.as_str()).find_map(|p| {
+            self.0
+                .get(&p.to_lowercase())
+                .filter(|(spelling, _)| spelling != p)
+                .map(|(spelling, _)| spelling.as_str())
+        })
+    }
+}
+
+/// Each directory prefix of `path`, then the full path.
+fn prefixes(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('/')
+        .map(|(i, _)| &path[..i])
+        .chain(std::iter::once(path))
 }
 
 pub struct Engine {
@@ -130,7 +197,12 @@ pub struct Engine {
     connected: HashSet<DeviceId>,
     /// What each connected peer has told us, by folder id and path.
     remote: HashMap<DeviceId, HashMap<i64, HashMap<RelPath, FileEntry>>>,
+    /// Active downloads, at most [`MAX_ACTIVE_DOWNLOADS`].
     downloads: HashMap<FileKey, Download>,
+    /// Decided downloads waiting for a slot, started in `queue` order. A
+    /// key in `queue` but not `queued` was cancelled while waiting.
+    queued: HashMap<FileKey, Queued>,
+    queue: VecDeque<FileKey>,
     requests: HashMap<u64, PendingRequest>,
     next_request: u64,
     /// Where each chunk hash can be read locally, per folder. Rebuilt lazily
@@ -140,12 +212,18 @@ pub struct Engine {
     /// (or already had). A rescan announces whatever differs from this, so
     /// changes recorded by another process (`nebula scan`) are not missed.
     known: HashMap<i64, HashMap<RelPath, Known>>,
+    /// Label and root of each folder as last seen. Folders are added and
+    /// removed by another process (`nebula add` / `remove`), and SQLite
+    /// reuses a removed folder's id, so every cache above is keyed by an id
+    /// that may later name a different folder.
+    folders_seen: HashMap<i64, (String, PathBuf)>,
     out: Vec<Output>,
 }
 
 impl Engine {
     /// `name` is this device's name, used to label conflict copies.
     pub fn new(store: Store, me: DeviceId, name: String) -> Result<Self> {
+        let folders_seen = folder_ids(&store.folders()?);
         Ok(Self {
             store,
             me,
@@ -153,10 +231,13 @@ impl Engine {
             connected: HashSet::new(),
             remote: HashMap::new(),
             downloads: HashMap::new(),
+            queued: HashMap::new(),
+            queue: VecDeque::new(),
             requests: HashMap::new(),
             next_request: 0,
             locators: HashMap::new(),
             known: HashMap::new(),
+            folders_seen,
             out: Vec::new(),
         })
     }
@@ -168,12 +249,30 @@ impl Engine {
 
     /// Downloads not yet finished, for status display and tests.
     pub fn pending_downloads(&self) -> usize {
+        self.downloads.len() + self.queued.len()
+    }
+
+    /// Downloads with an open temp file; never more than
+    /// [`MAX_ACTIVE_DOWNLOADS`].
+    pub fn active_downloads(&self) -> usize {
         self.downloads.len()
     }
 
     /// Processes one input and returns the messages to send, in order.
     /// Errors are logged and do not stop the engine.
     pub fn handle(&mut self, input: Input) -> Vec<Output> {
+        // Chunk traffic is frequent and never depends on the folder list,
+        // so only the other inputs check it for changes.
+        let refresh = match &input {
+            Input::Received { msg, .. } => {
+                matches!(msg, Message::Index { .. } | Message::Resend { .. })
+            }
+            Input::Disconnected { .. } => false,
+            Input::Connected { .. } | Input::LocalChange { .. } | Input::Tick => true,
+        };
+        if refresh && let Err(e) = self.refresh_folders() {
+            warn!("could not read the folder list: {e}");
+        }
         let result = match input {
             Input::Connected { peer } => self.on_connected(peer),
             Input::Disconnected { peer } => {
@@ -212,11 +311,86 @@ impl Engine {
         Ok(())
     }
 
+    /// Notices folders added, removed or replaced since the last call. A
+    /// vanished or reused id drops everything cached under it; a new folder
+    /// is offered to connected peers right away, with a request for theirs.
+    fn refresh_folders(&mut self) -> Result<()> {
+        let folders = self.store.folders()?;
+        let current = folder_ids(&folders);
+        let stale: Vec<i64> = self
+            .folders_seen
+            .iter()
+            .filter(|(id, seen)| current.get(id) != Some(seen))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            self.forget_folder(id);
+        }
+        for folder in &folders {
+            if !self.folders_seen.contains_key(&folder.id)
+                && let Err(e) = self.folder_added(folder)
+            {
+                warn!("could not offer new folder \"{}\": {e}", folder.label);
+            }
+        }
+        self.folders_seen = current;
+        Ok(())
+    }
+
+    fn forget_folder(&mut self, id: i64) {
+        if let Some((label, _)) = self.folders_seen.remove(&id) {
+            debug!("folder \"{label}\" is no longer synced; dropping its state");
+        }
+        for folders in self.remote.values_mut() {
+            folders.remove(&id);
+        }
+        self.locators.remove(&id);
+        self.known.remove(&id);
+        let keys: Vec<FileKey> = self
+            .downloads
+            .keys()
+            .chain(self.queued.keys())
+            .filter(|k| k.0 == id)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.cancel_download(&key);
+        }
+    }
+
+    /// Peers discarded our Index of this folder at connect time if it did
+    /// not exist yet (and we discarded theirs), so both sides resend.
+    fn folder_added(&mut self, folder: &Folder) -> Result<()> {
+        let entries = self.store.files(folder.id)?;
+        let snapshot = entries
+            .iter()
+            .map(|e| (e.path.clone(), Known::of(e)))
+            .collect();
+        let peers: Vec<DeviceId> = self.connected.iter().copied().collect();
+        for peer in peers {
+            info!(
+                "now syncing \"{}\"; asking {} for its files",
+                folder.label,
+                peer.short()
+            );
+            self.send_index(peer, &folder.label, entries.clone());
+            self.out.push(Output {
+                peer,
+                msg: Message::Resend {
+                    folder: folder.label.clone(),
+                },
+            });
+        }
+        self.known.insert(folder.id, snapshot);
+        Ok(())
+    }
+
     fn on_disconnected(&mut self, peer: DeviceId) {
         self.connected.remove(&peer);
         self.remote.remove(&peer);
         // Temp files stay on disk; the next download of the same content
         // picks up their verified prefix.
+        self.queued.retain(|_, q| q.from != peer);
         let stalled: Vec<FileKey> = self
             .downloads
             .iter()
@@ -251,8 +425,16 @@ impl Engine {
                 self.out.push(Output { peer, msg: reply });
                 Ok(())
             }
-            Message::Chunk { id, data } => self.on_chunk(id, Some(data)),
-            Message::Missing { id } => self.on_chunk(id, None),
+            Message::Chunk { id, data } => self.on_chunk(peer, id, Some(data)),
+            Message::Missing { id } => self.on_chunk(peer, id, None),
+            Message::Resend { folder } => {
+                // Only a folder we sync under that label is ever sent.
+                if let Some(folder) = self.store.folder_by_label(&folder)? {
+                    let entries = self.store.files(folder.id)?;
+                    self.send_index(peer, &folder.label, entries);
+                }
+                Ok(())
+            }
             // Session-level messages are handled by the caller.
             Message::Hello { .. }
             | Message::Ping { .. }
@@ -282,24 +464,42 @@ impl Engine {
                 continue;
             }
             known.insert(entry.path.clone(), entry.clone());
-            fresh.push(entry);
+            fresh.push((peer, entry));
         }
         let mut cases = self.case_map(folder.id)?;
-        for entry in fresh {
-            self.consider(&folder, peer, entry, &mut cases)?;
-        }
+        self.consider_all(&folder, &mut cases, fresh);
         self.pump_downloads()
     }
 
-    /// Lowercased path -> actual path, for every live local file.
-    fn case_map(&self, folder_id: i64) -> Result<HashMap<String, RelPath>> {
-        Ok(self
-            .store
-            .files(folder_id)?
-            .into_iter()
-            .filter(|e| !e.deleted)
-            .map(|e| (e.path.case_key(), e.path))
-            .collect())
+    /// Considers each offer, logging failures instead of giving up on the
+    /// rest: one unwritable file must not stall every other one forever.
+    fn consider_all(
+        &mut self,
+        folder: &Folder,
+        cases: &mut Cases,
+        mut offers: Vec<(DeviceId, FileEntry)>,
+    ) {
+        // Tombstones first. A case-only rename arrives as the old name's
+        // tombstone plus the new name, and the new name would otherwise be
+        // skipped as a case clash with the file about to be deleted.
+        offers.sort_by_key(|(_, e)| !e.deleted);
+        for (peer, entry) in offers {
+            let path = entry.path.clone();
+            if let Err(e) = self.consider(folder, peer, entry, cases) {
+                warn!("{path}: {e}");
+            }
+        }
+    }
+
+    /// Every live local file path and directory prefix, by case.
+    fn case_map(&self, folder_id: i64) -> Result<Cases> {
+        let mut cases = Cases::default();
+        for e in self.store.files(folder_id)? {
+            if !e.deleted {
+                cases.add(&e.path);
+            }
+        }
+        Ok(cases)
     }
 
     /// Decides what to do about one entry a peer announced.
@@ -308,11 +508,16 @@ impl Engine {
         folder: &Folder,
         peer: DeviceId,
         theirs: FileEntry,
-        cases: &mut HashMap<String, RelPath>,
+        cases: &mut Cases,
     ) -> Result<()> {
         let key = (folder.id, theirs.path.clone());
-        if let Some(d) = self.downloads.get(&key) {
-            if d.want.version.compare(&theirs.version) != Causality::Before {
+        let pending = self
+            .downloads
+            .get(&key)
+            .map(|d| &d.want)
+            .or_else(|| self.queued.get(&key).map(|q| &q.want));
+        if let Some(want) = pending {
+            if want.version.compare(&theirs.version) != Causality::Before {
                 return Ok(()); // Already fetching this or something newer.
             }
             self.cancel_download(&key);
@@ -343,16 +548,14 @@ impl Engine {
                 Ok(())
             }
             Resolution::TakeRemote => {
-                if let Some(existing) = cases.get(&theirs.path.case_key())
-                    && existing != &theirs.path
-                {
+                if let Some(existing) = cases.clash(&theirs.path) {
                     warn!(
                         "{}: skipped; this device has \"{existing}\", which differs only in letter case",
                         theirs.path
                     );
                     return Ok(());
                 }
-                self.take(folder, peer, ours, theirs, false)
+                self.take(folder, peer, ours, theirs, false, cases)
             }
             Resolution::Conflict {
                 winner: Side::Remote,
@@ -362,7 +565,7 @@ impl Engine {
                      version is saved as a conflict copy",
                     theirs.path
                 );
-                self.take(folder, peer, ours, theirs, true)
+                self.take(folder, peer, ours, theirs, true, cases)
             }
         }
     }
@@ -392,7 +595,11 @@ impl Engine {
         ours: Option<FileEntry>,
         theirs: FileEntry,
         conflict: bool,
+        cases: &mut Cases,
     ) -> Result<()> {
+        // Whether `cases` counts this path now; it must stay accurate for the
+        // rest of the batch (see `consider_all`).
+        let live = ours.as_ref().is_some_and(|o| !o.deleted);
         let Some(target) = safe_target(&folder.root, &theirs.path) else {
             warn!(
                 "{}: skipped; the path passes through a link or a file",
@@ -418,6 +625,9 @@ impl Engine {
                 entry.version = o.version.merged(&entry.version);
             }
             self.put(folder.id, &entry)?;
+            if live {
+                cases.remove(&theirs.path);
+            }
             if entry.version != theirs.version {
                 self.announce(folder, vec![entry]);
             }
@@ -428,25 +638,61 @@ impl Engine {
             (Some(o), true) => Some(self.free_copy_name(folder, o)?),
             _ => None,
         };
-        self.start_download(folder.clone(), peer, ours, theirs, loser_copy)
+        if !live {
+            cases.add(&theirs.path);
+        }
+        let key = (folder.id, theirs.path.clone());
+        if !self.queued.contains_key(&key) {
+            self.queue.push_back(key.clone());
+        }
+        self.queued.insert(
+            key,
+            Queued {
+                folder: folder.clone(),
+                from: peer,
+                base: ours,
+                want: theirs,
+                loser_copy,
+            },
+        );
+        Ok(())
     }
 
-    fn start_download(
-        &mut self,
-        folder: Folder,
-        from: DeviceId,
-        base: Option<FileEntry>,
-        want: FileEntry,
-        loser_copy: Option<RelPath>,
-    ) -> Result<()> {
+    /// Starts queued downloads while there are free slots.
+    fn start_queued(&mut self) {
+        while self.downloads.len() < MAX_ACTIVE_DOWNLOADS {
+            let Some(key) = self.queue.pop_front() else {
+                return;
+            };
+            let Some(q) = self.queued.remove(&key) else {
+                continue; // Cancelled while waiting.
+            };
+            let path = q.want.path.clone();
+            if let Err(e) = self.start_download(q) {
+                warn!("{path}: could not start the download: {e}");
+            }
+        }
+    }
+
+    fn start_download(&mut self, q: Queued) -> Result<()> {
+        let Queued {
+            folder,
+            from,
+            base,
+            want,
+            loser_copy,
+        } = q;
         let Some(target) = safe_target(&folder.root, &want.path) else {
             return Ok(());
         };
         let dir = target.parent().unwrap_or(&folder.root).to_path_buf();
         fs::create_dir_all(&dir)?;
+        // Named by content so an interrupted download resumes, and by path
+        // so identical files in one directory don't share a temp file.
         let temp = dir.join(format!(
-            "{TEMP_PREFIX}{}",
-            &want.content_hash.to_string()[..16]
+            "{TEMP_PREFIX}{}-{}",
+            &want.content_hash.to_string()[..16],
+            &Digest::of(want.path.as_str().as_bytes()).to_string()[..8]
         ));
         let mut file = OpenOptions::new()
             .read(true)
@@ -502,9 +748,19 @@ impl Engine {
         Ok(())
     }
 
-    fn on_chunk(&mut self, id: u64, data: Option<Vec<u8>>) -> Result<()> {
-        let Some(req) = self.requests.remove(&id) else {
+    fn on_chunk(&mut self, peer: DeviceId, id: u64, data: Option<Vec<u8>>) -> Result<()> {
+        let Some(key) = self.requests.get(&id).map(|r| r.key.clone()) else {
             return Ok(()); // Unknown or from a cancelled download.
+        };
+        // Only the device we asked may answer. Request ids are sequential,
+        // so another peer could otherwise cancel the download by guessing
+        // one and replying Missing.
+        if self.downloads.get(&key).is_some_and(|d| d.from != peer) {
+            debug!("{}: ignored a reply from {}", key.1, peer.short());
+            return Ok(());
+        }
+        let Some(req) = self.requests.remove(&id) else {
+            return Ok(());
         };
         let Some(d) = self.downloads.get_mut(&req.key) else {
             return Ok(());
@@ -523,7 +779,6 @@ impl Engine {
                     d.want.path
                 );
                 self.cancel_download(&req.key);
-                return Ok(());
             }
             None => {
                 info!(
@@ -531,22 +786,30 @@ impl Engine {
                     d.want.path
                 );
                 self.cancel_download(&req.key);
-                return Ok(());
             }
         }
+        // Also after a cancel, so a queued download takes the free slot.
         self.pump_downloads()
     }
 
-    /// Writes whatever chunks are ready, tops up requests, finishes files.
+    /// Starts queued downloads as slots free up, writes whatever chunks are
+    /// ready, tops up requests and finishes files.
     fn pump_downloads(&mut self) -> Result<()> {
-        let keys: Vec<FileKey> = self.downloads.keys().cloned().collect();
-        for key in keys {
-            if let Err(e) = self.pump(&key) {
-                warn!("{}: download failed: {e}", key.1);
-                self.cancel_download(&key);
+        loop {
+            self.start_queued();
+            let keys: Vec<FileKey> = self.downloads.keys().cloned().collect();
+            for key in keys {
+                if let Err(e) = self.pump(&key) {
+                    warn!("{}: download failed: {e}", key.1);
+                    self.cancel_download(&key);
+                }
+            }
+            // Downloads that completed from local chunks free their slot
+            // without any message arriving, so refill until none do.
+            if self.queued.is_empty() || self.downloads.len() >= MAX_ACTIVE_DOWNLOADS {
+                return Ok(());
             }
         }
-        Ok(())
     }
 
     fn pump(&mut self, key: &FileKey) -> Result<()> {
@@ -643,6 +906,19 @@ impl Engine {
             let _ = fs::remove_file(&d.temp);
             return Ok(());
         }
+        // Chunk messages don't refresh the folder list, so the folder may
+        // have been removed (or its id reused) since the last check.
+        let still_synced = self
+            .store
+            .folders()?
+            .iter()
+            .any(|f| f.id == d.folder.id && f.root == d.folder.root);
+        if !still_synced {
+            info!("{path}: its folder is no longer synced; discarding the download");
+            drop(d.file);
+            let _ = fs::remove_file(&d.temp);
+            return Ok(());
+        }
         let Some(target) = safe_target(&d.folder.root, &path) else {
             return Ok(());
         };
@@ -661,6 +937,15 @@ impl Engine {
             && let Some(copy_path) = safe_target(&d.folder.root, copy)
             && target.exists()
         {
+            // The name was free when the download was decided; never let
+            // the rename replace a file that has appeared there since.
+            if copy_path.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("conflict copy \"{copy}\" already exists"),
+                )
+                .into());
+            }
             fs::rename(&target, &copy_path)?;
             info!("{path}: this device's version was kept as \"{copy}\"");
         }
@@ -696,6 +981,7 @@ impl Engine {
 
     fn cancel_download(&mut self, key: &FileKey) {
         self.downloads.remove(key);
+        self.queued.remove(key);
         self.requests.retain(|_, r| &r.key != key);
     }
 
@@ -785,9 +1071,9 @@ impl Engine {
                         .map(|e| (*peer, e.clone()))
                 })
                 .collect();
-            let mut cases = self.case_map(folder.id)?;
-            for (peer, entry) in offers {
-                self.consider(&folder, peer, entry, &mut cases)?;
+            match self.case_map(folder.id) {
+                Ok(mut cases) => self.consider_all(&folder, &mut cases, offers),
+                Err(e) => warn!("could not read \"{}\": {e}", folder.label),
             }
         }
         self.pump_downloads()
@@ -812,7 +1098,10 @@ impl Engine {
         let mut batch = Vec::new();
         let mut size = 0;
         for e in entries {
-            let len = 64 + e.path.as_str().len() + e.chunks.len() * 40;
+            // Measured rather than estimated: version vectors grow with
+            // every device that ever touched a file, and an oversized
+            // message is dropped by the transport.
+            let len = postcard::to_stdvec(&e).map_or(INDEX_BATCH_BYTES, |v| v.len());
             if !batch.is_empty() && size + len > INDEX_BATCH_BYTES {
                 self.out.push(Output {
                     peer,
@@ -857,17 +1146,24 @@ impl Engine {
                 .peer(&ours.modified_by)?
                 .map_or_else(|| ours.modified_by.short(), |p| p.name)
         };
-        let mut name = conflict_copy_name(&ours.path, &label, ours.mtime_ns)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        for n in 2..100 {
-            let taken = safe_target(&folder.root, &name).is_none_or(|p| p.exists());
-            if !taken {
-                break;
-            }
-            name = conflict_copy_name(&ours.path, &format!("{label} {n}"), ours.mtime_ns)
+        for n in 1..100 {
+            let tag = if n == 1 {
+                label.clone()
+            } else {
+                format!("{label} {n}")
+            };
+            let name = conflict_copy_name(&ours.path, &tag, ours.mtime_ns)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            if safe_target(&folder.root, &name).is_some_and(|p| !p.exists()) {
+                return Ok(name);
+            }
         }
-        Ok(name)
+        // Renaming onto a taken name would destroy that file.
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{}: no free conflict copy name", ours.path),
+        )
+        .into())
     }
 
     fn locator(&mut self, folder_id: i64) -> &HashMap<Digest, (RelPath, u64, u32)> {
@@ -924,6 +1220,13 @@ impl Engine {
             },
         )
     }
+}
+
+fn folder_ids(folders: &[Folder]) -> HashMap<i64, (String, PathBuf)> {
+    folders
+        .iter()
+        .map(|f| (f.id, (f.label.clone(), f.root.clone())))
+        .collect()
 }
 
 /// Rejects entries that are internally inconsistent.

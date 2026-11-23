@@ -7,7 +7,7 @@ use nebula_core::manifest::FileEntry;
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever a message changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
@@ -50,6 +50,12 @@ pub enum Message {
     Missing {
         id: u64,
     },
+    /// Asks for the sender's whole Index of the folder labelled `folder`.
+    /// Sent when a folder is added while connected: the peer's Index from
+    /// connect time was discarded then, because the label was unknown.
+    Resend {
+        folder: String,
+    },
 }
 
 impl Message {
@@ -78,6 +84,9 @@ mod tests {
             Message::Pong { nonce: u64::MAX },
             Message::Note {
                 text: "hello".into(),
+            },
+            Message::Resend {
+                folder: "photos".into(),
             },
         ] {
             assert_eq!(Message::decode(&m.encode()).unwrap(), m);
