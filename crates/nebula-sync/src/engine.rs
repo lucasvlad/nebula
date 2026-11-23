@@ -80,6 +80,22 @@ pub struct Output {
 
 type FileKey = (i64, RelPath);
 
+/// The parts of an entry that matter for whether peers must hear about it.
+#[derive(Clone, PartialEq, Eq)]
+struct Known {
+    version: nebula_core::version::VersionVector,
+    deleted: bool,
+}
+
+impl Known {
+    fn of(e: &FileEntry) -> Self {
+        Self {
+            version: e.version.clone(),
+            deleted: e.deleted,
+        }
+    }
+}
+
 /// A file being assembled from local and remote chunks.
 struct Download {
     folder: Folder,
@@ -120,6 +136,10 @@ pub struct Engine {
     /// Where each chunk hash can be read locally, per folder. Rebuilt lazily
     /// after the folder's manifest changes.
     locators: HashMap<i64, HashMap<Digest, (RelPath, u64, u32)>>,
+    /// Per folder, the version of each entry our peers have been told about
+    /// (or already had). A rescan announces whatever differs from this, so
+    /// changes recorded by another process (`nebula scan`) are not missed.
+    known: HashMap<i64, HashMap<RelPath, Known>>,
     out: Vec<Output>,
 }
 
@@ -136,6 +156,7 @@ impl Engine {
             requests: HashMap::new(),
             next_request: 0,
             locators: HashMap::new(),
+            known: HashMap::new(),
             out: Vec::new(),
         })
     }
@@ -180,7 +201,13 @@ impl Engine {
                 folder.label,
                 peer.short()
             );
+            let snapshot = entries
+                .iter()
+                .map(|e| (e.path.clone(), Known::of(e)))
+                .collect();
             self.send_index(peer, &folder.label, entries);
+            // The peer now has everything as it stands.
+            self.known.insert(folder.id, snapshot);
         }
         Ok(())
     }
@@ -353,8 +380,7 @@ impl Engine {
             return Ok(());
         }
         ours.version = merged;
-        self.store
-            .put_files(folder.id, std::slice::from_ref(&ours))?;
+        self.put(folder.id, &ours)?;
         self.announce(folder, vec![ours]);
         Ok(())
     }
@@ -391,9 +417,7 @@ impl Engine {
             if let Some(o) = &ours {
                 entry.version = o.version.merged(&entry.version);
             }
-            self.store
-                .put_files(folder.id, std::slice::from_ref(&entry))?;
-            self.locators.remove(&folder.id);
+            self.put(folder.id, &entry)?;
             if entry.version != theirs.version {
                 self.announce(folder, vec![entry]);
             }
@@ -649,9 +673,7 @@ impl Engine {
         if let Some(base) = &d.base {
             entry.version = base.version.merged(&entry.version);
         }
-        self.store
-            .put_files(d.folder.id, std::slice::from_ref(&entry))?;
-        self.locators.remove(&d.folder.id);
+        self.put(d.folder.id, &entry)?;
         if d.base
             .as_ref()
             .is_some_and(|b| !b.deleted && b.content_hash == entry.content_hash)
@@ -687,35 +709,61 @@ impl Engine {
         else {
             return Ok(());
         };
-        let before: HashMap<RelPath, FileEntry> = self
-            .store
-            .files(folder.id)?
-            .into_iter()
-            .map(|e| (e.path.clone(), e))
-            .collect();
-        let report = scanner::scan(&mut self.store, &folder, self.me)?;
-        if !report.has_changes() {
-            return Ok(());
+        if !self.known.contains_key(&folder.id) {
+            // First scan of this folder while running: what is stored now
+            // was sent in full when each peer connected.
+            let seed = self.snapshot(folder.id)?;
+            self.known.insert(folder.id, seed);
         }
-        self.locators.remove(&folder.id);
+        let report = scanner::scan(&mut self.store, &folder, self.me)?;
+        let known = self.known.get(&folder.id);
         let changed: Vec<FileEntry> = self
             .store
             .files(folder.id)?
             .into_iter()
-            .filter(|e| {
-                before
-                    .get(&e.path)
-                    .is_none_or(|b| b.version != e.version || b.deleted != e.deleted)
-            })
+            .filter(|e| known.and_then(|k| k.get(&e.path)) != Some(&Known::of(e)))
             .collect();
-        info!(
-            "\"{}\": {} added, {} modified, {} deleted on this device",
-            folder.label,
-            report.added.len(),
-            report.modified.len(),
-            report.deleted.len()
-        );
+        if changed.is_empty() {
+            return Ok(());
+        }
+        self.locators.remove(&folder.id);
+        if report.has_changes() {
+            info!(
+                "\"{}\": {} added, {} modified, {} deleted on this device",
+                folder.label,
+                report.added.len(),
+                report.modified.len(),
+                report.deleted.len()
+            );
+        } else {
+            info!(
+                "\"{}\": {} change(s) recorded by `nebula scan`; telling the other devices",
+                folder.label,
+                changed.len()
+            );
+        }
         self.announce(&folder, changed);
+        Ok(())
+    }
+
+    fn snapshot(&self, folder_id: i64) -> Result<HashMap<RelPath, Known>> {
+        Ok(self
+            .store
+            .files(folder_id)?
+            .into_iter()
+            .map(|e| (e.path.clone(), Known::of(&e)))
+            .collect())
+    }
+
+    /// Stores an entry learned from or settled with a peer. Peers already
+    /// have (or are told about) this version, so it is recorded as known.
+    fn put(&mut self, folder_id: i64, entry: &FileEntry) -> Result<()> {
+        self.store
+            .put_files(folder_id, std::slice::from_ref(entry))?;
+        self.locators.remove(&folder_id);
+        if let Some(k) = self.known.get_mut(&folder_id) {
+            k.insert(entry.path.clone(), Known::of(entry));
+        }
         Ok(())
     }
 
@@ -748,6 +796,10 @@ impl Engine {
     fn announce(&mut self, folder: &Folder, entries: Vec<FileEntry>) {
         if entries.is_empty() {
             return;
+        }
+        let known = self.known.entry(folder.id).or_default();
+        for e in &entries {
+            known.insert(e.path.clone(), Known::of(e));
         }
         let peers: Vec<DeviceId> = self.connected.iter().copied().collect();
         for peer in peers {
