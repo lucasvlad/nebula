@@ -87,7 +87,7 @@ tests/               cross-crate tests, fault-injection proxy, evaluation, attac
 | `store.rs` | SQLite in WAL mode (crash-safe). Tables: folders (with a label), file manifests, the paired-device allowlist, and settings. Schema migrations run automatically. |
 | `scanner.rs` | Walks a folder and updates its manifest. It only re-reads files whose size or mtime changed, with a 2 s "racy" window so coarse-mtime edits aren't missed. It never mass-deletes if a folder is missing, never tombstones files under an unreadable directory, and skips symlinks, illegal names and case clashes. |
 | `watcher.rs` | OS file-change notifications (debounced 500 ms) trigger a rescan of that folder. |
-| `protocol.rs` | Wire messages: Hello, Ping/Pong, Note (demo), Index (file list), Request/Chunk/Missing (chunk transfer). |
+| `protocol.rs` | Wire messages: Hello, Ping/Pong, Note (demo), Index (file list), Request/Chunk/Missing (chunk transfer), Resend (ask for a folder's index when it is added mid-session). |
 | `engine.rs` | **The sync engine.** A pure state machine: inputs (connected, message, local change, tick) go in and messages to send come out. It exchanges indexes and decides per file using version vectors. It requests only chunks it doesn't already have, verifies every chunk, assembles in a temp file, verifies the whole file and renames it into place. Interrupted downloads resume. It never overwrites an edit it hasn't seen. Conflicts keep both versions. |
 
 ### nebula-cli (`nebula` program)

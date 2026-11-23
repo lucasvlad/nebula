@@ -25,9 +25,9 @@ fetch theirs; concurrent means a conflict, resolved by `nebula_core::conflict::r
 
 **Transfer.** A download requests only chunks not already present in the folder (any file), keeping 32
 requests in flight. Each chunk is verified against its BLAKE3 hash before it is written. The file is
-assembled in `.nebula-tmp-<content hash>` next to its destination, verified against the whole-file
-hash, given the sender's mtime, fsynced, and renamed into place. Because the temp name depends on the
-content, an interrupted download resumes: the verified prefix of the temp file is kept, and only the
+assembled in `.nebula-tmp-<content hash>-<path hash>` next to its destination, verified against the
+whole-file hash, given the sender's mtime, fsynced, and renamed into place. Because the temp name
+depends only on the content and path, an interrupted download resumes: the verified prefix of the temp file is kept, and only the
 remaining chunks are requested.
 
 **Never overwrite unseen edits.** Immediately before renaming or deleting, the engine checks that the
@@ -45,8 +45,8 @@ saved makes "dominates" true in substance as well as on paper.
 rescan then finds nothing new, so no special suppression is needed and sync loops cannot start.
 
 **Validation.** Entries whose chunk lengths don't sum to the size, or exceed the chunker maximum, are
-dropped. Paths that would pass through a symlink or a file, or that differ only by case from a local
-file, are skipped. Chunk requests are answered only from the named folder's manifest, and the data is
+dropped. Paths that would pass through a symlink or a file, or whose name or any parent directory
+differs only by case from a local one, are skipped. Chunk requests are answered only from the named folder's manifest, and the data is
 re-hashed before it is sent.
 
 ## Alternatives considered
@@ -67,3 +67,9 @@ LBFS) for chunk-level transfer; Shapiro et al. (2011) for convergence as the cor
 Convergence is tested by a property test of random writes and deletes on both sides with random sync
 points (`crates/nebula-sync/tests/sync.rs`; 300 cases pass). Empty directories are not synced or
 removed. The message limit (16 MiB) caps files at about 3.5 GB in the MVP.
+
+At most 16 downloads are active at once; further decisions wait in a FIFO queue and open their temp
+file only when they start, so a large initial sync cannot exhaust file descriptors (macOS allows 256
+by default). A folder added while connected is announced with its Index plus `Resend { folder }`
+(protocol version 3), asking the peer for its whole Index of that folder, which it had discarded at
+connect time because the label was unknown.
