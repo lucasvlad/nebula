@@ -332,6 +332,38 @@ fn local_edit_during_download_is_not_overwritten() {
 }
 
 #[test]
+fn changes_recorded_by_another_process_are_announced() {
+    // A's engine uses a database file that `nebula scan` (another process)
+    // also writes to.
+    let a_dir = tempfile::tempdir().unwrap();
+    let db = a_dir.path().join("state.db");
+    let root = a_dir.path().join("files");
+    fs::create_dir(&root).unwrap();
+    let store = Store::open(&db).unwrap();
+    store.add_folder(&root, "shared").unwrap();
+    let mut a = Dev {
+        dir: a_dir,
+        engine: Engine::new(store, DeviceId([1; 32]), "A".into()).unwrap(),
+        id: DeviceId([1; 32]),
+    };
+    let mut b = Dev::new(2, "B");
+    connect(&mut a, &mut b);
+
+    fs::write(root.join("by-hand.txt"), b"scanned by nebula scan").unwrap();
+    let mut other = Store::open(&db).unwrap();
+    let folder = other.folder_by_label("shared").unwrap().unwrap();
+    nebula_sync::scanner::scan(&mut other, &folder, a.id).unwrap();
+
+    // The daemon's own rescan finds nothing new on disk, but must still
+    // tell B about the change the other process recorded.
+    change_on(&mut a, &mut b);
+    assert_eq!(
+        fs::read(b.path("by-hand.txt")).unwrap(),
+        b"scanned by nebula scan"
+    );
+}
+
+#[test]
 fn hostile_index_and_requests_are_refused() {
     let mut a = Dev::new(1, "A");
     let mut b = Dev::new(2, "B");
