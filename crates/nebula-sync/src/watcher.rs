@@ -223,7 +223,10 @@ mod tests {
         }
         let seen = changes_within(&rx, Duration::from_secs(3));
         assert!(!seen.is_empty(), "burst not reported");
-        assert!(seen.len() < 25, "burst of 50 writes not debounced: {seen:?}");
+        assert!(
+            seen.len() < 25,
+            "burst of 50 writes not debounced: {seen:?}"
+        );
     }
 
     #[test]
