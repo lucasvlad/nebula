@@ -119,6 +119,8 @@ struct Walk {
 
 pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<ScanReport, ScanError> {
     let started_ns = now_ns();
+    // Version stamps for edits found in this scan (see `VersionVector::bump`).
+    let now = u64::try_from(started_ns).unwrap_or(0);
     if !folder.root.is_dir() {
         return Err(ScanError::RootMissing(folder.root.clone()));
     }
@@ -240,7 +242,7 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
                     size: entry.size,
                 });
                 entry.version = old.version.clone();
-                entry.version.increment(device);
+                entry.version.bump(device, now);
                 info!(
                     "{}: changed, so this device's edit count goes up to {}",
                     entry.path,
@@ -253,7 +255,7 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
                 if let Some(tomb) = known.get(&found.path) {
                     entry.version = tomb.version.clone();
                 }
-                entry.version.increment(device);
+                entry.version.bump(device, now);
                 if known.contains_key(&found.path) {
                     info!(
                         "{}: recreated after being deleted, continuing its version history",
@@ -288,7 +290,7 @@ pub fn scan(store: &mut Store, folder: &Folder, device: DeviceId) -> Result<Scan
         }
         info!("{path}: deleted, recording a tombstone so other devices delete it too");
         let mut tomb = entry.clone();
-        tomb.mark_deleted(device);
+        tomb.mark_deleted(device, now);
         report.deleted.push(path.clone());
         changed.push(tomb);
     }
@@ -483,7 +485,8 @@ mod tests {
         assert_eq!((r.read_files, r.read_bytes), (2, 100_005));
         let b = fx.entry("sub/dir/b.bin");
         assert_eq!(b.size, 100_000);
-        assert_eq!(b.version.get(&DEV), 1);
+        // Stamped with the scan time (VersionVector::bump), not a bare 1.
+        assert!(b.version.get(&DEV) > 1_000_000_000_000_000_000);
         assert_eq!(
             b.chunks.iter().map(|c| u64::from(c.len)).sum::<u64>(),
             100_000
@@ -534,11 +537,12 @@ mod tests {
         let p = fx.write("a.txt", b"hello");
         fx.scan();
         fs::remove_file(&p).unwrap();
+        let live = fx.entry("a.txt");
         let r = fx.scan();
         assert_eq!(paths(&r.deleted), ["a.txt"]);
         let tomb = fx.entry("a.txt");
         assert!(tomb.deleted);
-        assert_eq!(tomb.version.get(&DEV), 2);
+        assert_eq!(tomb.version.compare(&live.version), Causality::After);
 
         // A second scan does not delete it again.
         assert!(!fx.scan().has_changes());
