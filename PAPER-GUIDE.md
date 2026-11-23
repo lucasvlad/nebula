@@ -1,7 +1,7 @@
 # Nebula: guide for writing the paper and giving the demo
 
-One-stop reference for the COS 492 capstone paper and presentation. Status as of **2026-11-13**:
-the MVP is complete (milestones m0–m5 tagged), and all 176 tests pass on macOS, Linux and Windows CI.
+One-stop reference for the COS 492 capstone paper and presentation. Status as of **2026-11-23**:
+the MVP is complete and audited (milestones m0–m6 tagged), and all 199 tests pass on macOS, Linux and Windows CI.
 
 > **For an AI session reading this:** the course forbids GenAI in *any part of writing the paper*.
 > Help Lucas understand the project, find facts and numbers, check accuracy, and answer questions.
@@ -46,6 +46,7 @@ It is written in Rust: about 9,600 lines in 4 crates plus a test package. Repo: 
 | `m2` / #5–#7 | Oct 13 – Nov 4 | Pairing, encrypted sessions, discovery, fault proxy, security codes, attack demo |
 | `m3`+`m4` / #8 | Nov 4 | Two-way sync engine, file watcher, background daemon (M3 and M4 merged into one) |
 | `m5` / #9 | Nov 13 | Evaluation harness and results; SQLite CVE fix |
+| `m6` / #12–#15 | Nov 23 | Full audit (2 critical, 4 high, 6 medium, 6 low findings), all fixed with regression tests; see §6a |
 
 Schedule notes: M1 and M2 finished well ahead of plan. M3 slipped about 4 days, recovered by
 building M4 at the same time. Remaining: M6 freeze (bug fixes only) Nov 16–20, draft paper Nov 21,
@@ -135,6 +136,25 @@ Worldview sources: Dyer, *From the Garden to the City*; ACM Code of Ethics (priv
 4. **M3 and M4 merged** into one bidirectional engine, to recover schedule.
 5. **Added beyond the brief:** security codes (four words) and the attack demo, from Checkpoint 2 feedback; folder **labels** match folders across devices; a **16 MiB message cap**, which limits files to about 3.5 GB in the MVP.
 
+## 6a. M6 audit (Nov 23): what was found and fixed
+
+A subagent audited the whole project, and every finding was fixed with a regression test that fails on the old code.
+This is useful material for the discussion section (testing found what the design missed):
+
+**Critical findings:**
+- A folder with more than ~240 files stalled forever: one open temp file per download exhausted the file-handle limit.
+  - Fix: at most 16 active downloads, with a queue.
+- After a folder was removed and re-added (or `state.db` was lost), version counters restarted at 1, so later edits could be silently overwritten or diverge.
+  - Fix: counters are clock-stamped, `max(previous + 1, now)`, and equal vectors with different contents count as a conflict (ADR 0003 amendment).
+
+**Other findings:**
+- An oversized index message could be silently dropped.
+- Unbounded queues let a paired device exhaust memory. They are now bounded, with in-flight request caps.
+- Reused folder IDs leaked state between folders.
+- Unpaired devices could exhaust file handles. Handshakes are now capped at 32.
+- Smaller problems: a folder added mid-session (new `Resend` message), case-only renames, `remove` of a deleted folder, `scan` stopping at the first error, temp-name clashes, and eval-script portability.
+- `cargo audit` is now completely clean.
+
 ## 7. Evaluation results (brief §6), summarised
 
 Full tables are in `docs/evaluation/`. Machine: Apple M3 MacBook, 16 GiB, macOS 26, loopback.
@@ -144,7 +164,7 @@ Full tables are in `docs/evaluation/`. Machine: Apple M3 MacBook, 16 GiB, macOS 
 | Correctness | **1000/1000** random edit/delete sequences on two devices converged to identical folders |
 | Delta, 100 MiB file | Insert 1 byte at start: **7.1 KiB** sent (fixed 8 KiB blocks: 100 MiB). Insert 1 KiB mid-file: 55.7 KiB (fixed: 50 MiB). Delete 1000 B mid-file: 53.8 KiB (fixed: 50 MiB). Append 1 MiB: 1.0 MiB. **Overwrite 1 byte: 54.7 KiB (fixed: 8 KiB, so fixed blocks win here)** |
 | Conflicts | Both versions kept; zero bytes lost (tested in-process and live) |
-| Large files | 1 MiB in 0.14 s; 100 MiB in 0.71 s (141 MiB/s); **1 GiB in 7.8 s (132 MiB/s)**. Receiver peak memory 28 MiB; sender 93 MiB at 1 GiB |
+| Large files | m5 run: 1 MiB in 0.14 s; 100 MiB in 0.71 s (141 MiB/s); **1 GiB in 7.8 s (132 MiB/s)**; receiver peak 28 MiB, sender 93 MiB. m6 re-runs on a busier machine: 93–106 MiB/s at 1 GiB (the old m5 code measured only 27 MiB/s in the same session), receiver 29–49 MiB. **Throughput depends on machine load: for the final paper, re-run on a quiet machine and report the median of 3** |
 | Dropped connection | `kill -9` at 52 % of 1 GiB, then restart: kept 68,229 of 131,009 chunks, done in 3.0 s, byte-identical |
 | Security | All pass: no plaintext or keys on the wire, a flipped bit is rejected (handshake and data), an unpaired device is refused before any data, 3 wrong codes lock out, the code never appears on the wire |
 
