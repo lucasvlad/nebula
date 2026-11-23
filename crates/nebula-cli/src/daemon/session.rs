@@ -392,6 +392,7 @@ fn kind(m: &Message) -> &'static str {
         Message::Request { .. } => "Request",
         Message::Chunk { .. } => "Chunk",
         Message::Missing { .. } => "Missing",
+        Message::Resend { .. } => "Resend",
     }
 }
 
