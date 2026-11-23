@@ -215,14 +215,18 @@ mod tests {
         let seen = changes_within(&rx, Duration::from_secs(3));
         assert!(seen.is_empty(), "temp file reported: {seen:?}");
 
-        // A burst of writes gives a few callbacks, not one per file. (The OS
-        // may deliver it across several debounce windows.)
+        // A burst of writes gives a few callbacks, not one per file. The OS
+        // may spread it over several debounce windows (7 were seen on a busy
+        // CI runner), so only require far fewer callbacks than writes.
         for i in 0..50 {
             std::fs::write(a.path().join(format!("f{i}")), b"x").unwrap();
         }
         let seen = changes_within(&rx, Duration::from_secs(3));
         assert!(!seen.is_empty(), "burst not reported");
-        assert!(seen.len() <= 6, "burst not debounced: {seen:?}");
+        assert!(
+            seen.len() < 25,
+            "burst of 50 writes not debounced: {seen:?}"
+        );
     }
 
     #[test]
