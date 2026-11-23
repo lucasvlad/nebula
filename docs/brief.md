@@ -90,6 +90,24 @@ Write a fault-injection TCP proxy in `tests/` that can drop, delay, truncate, an
 
 Cut line: if M3 slips past Nov 4, drop mDNS to `--addr` only and defer everything in the stretch list.
 
+### 8.1 Status and plan for M6–M7 (updated Nov 23)
+
+m0–m5 are done and tagged; the paper draft is submitted. M6 (bug fixes from a full audit) runs first, on
+`fix/*` branches. **M7 is a demo UI**, built on its own long-lived branch `feat/ui` so `main` stays demo-ready:
+
+- **What:** a local web page served by `nebula run` and opened with `nebula ui` (which opens the browser).
+  It shows this device's name and ID, paired devices (online or offline, with security codes), synced
+  folders, a live activity feed ("photo.jpg arrived from Desktop, 2.3 KiB of 95 MiB sent"), and transfer
+  progress. Buttons cover pair (show code / enter code), add folder and unpair. Styling uses `docs/ui-palette.md`.
+- **Why a web page:** it needs no install and works the same on all three OSes. It talks to the running daemon
+  directly, so it can show live events the CLI can't stream. Two windows side by side (one per device, or two
+  `--home` directories on one laptop) make syncing visible to a non-CS audience.
+- **Security:** it listens on 127.0.0.1 only, and every request needs a random per-launch token that `nebula ui`
+  puts in the URL. The Host header is checked against DNS rebinding. It is a thin layer over the same code paths
+  as the CLI, so the security model is unchanged. ADR 0007 records this.
+- **Cut line:** if the UI isn't stable by Dec 4, the demo uses the CLI and the `mitm-demo` program, and the UI
+  is mentioned as future work.
+
 ## 9. Sources to code (narrowed; each earns its place)
 
 Principle: reuse sources across the paper, and add one only if it holds information no other source does and the code needs it. All six below were verified against the real publications.
