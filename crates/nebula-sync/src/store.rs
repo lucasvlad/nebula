@@ -439,7 +439,7 @@ mod tests {
         let mut store = Store::open_in_memory().unwrap();
         let f = store.add_folder(Path::new("/r"), "r").unwrap();
         let mut gone = entry("old.txt");
-        gone.mark_deleted(DeviceId([8; 32]));
+        gone.mark_deleted(DeviceId([8; 32]), 0);
         let saved = vec![entry("docs/é.txt"), gone];
         store.save_scan(f.id, &saved, 42).unwrap();
         let mut loaded = store.files(f.id).unwrap();

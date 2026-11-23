@@ -54,6 +54,22 @@ impl VersionVector {
         *c
     }
 
+    /// Records a new edit by `device`, stamped with the larger of the next
+    /// counter value and `now` (nanoseconds since the Unix epoch).
+    ///
+    /// Values still only grow, so every dominance rule holds. The clock
+    /// component matters when a device loses its history (a folder removed
+    /// and re-added, or its state deleted): its counters would otherwise
+    /// restart at 1 and reuse values peers have already seen, making a new
+    /// edit look older than or equal to an old one. Stamped with the clock,
+    /// an edit made after the reset is larger than anything issued before
+    /// it, so it shows up as newer or concurrent, never older.
+    pub fn bump(&mut self, device: DeviceId, now: u64) -> u64 {
+        let c = self.0.entry(device).or_insert(0);
+        *c = c.saturating_add(1).max(now);
+        *c
+    }
+
     /// Pointwise maximum.
     pub fn merge(&mut self, other: &Self) {
         for (device, &n) in &other.0 {
@@ -214,6 +230,13 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn bump_always_makes_after(a in vv(), d in 0u8..4, now in any::<u64>()) {
+            let mut b = a.clone();
+            b.bump(dev(d), now);
+            prop_assert_eq!(b.compare(&a), Causality::After);
+        }
+
         #[test]
         fn matches_naive(a in vv(), b in vv()) {
             prop_assert_eq!(a.compare(&b), naive(&a, &b));

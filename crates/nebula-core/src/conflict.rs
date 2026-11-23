@@ -30,7 +30,17 @@ pub enum Resolution {
 /// Version vectors decide whether there is a conflict at all. Only when the
 /// edits are concurrent do mtimes matter, and then only to pick a winner.
 pub fn resolve(local: &FileEntry, remote: &FileEntry) -> Resolution {
-    match local.version.compare(&remote.version) {
+    let differ = local.deleted != remote.deleted
+        || (!local.deleted && local.content_hash != remote.content_hash);
+    let causality = match local.version.compare(&remote.version) {
+        // Equal histories with different contents cannot happen between
+        // honest peers that kept their state, but can after a device lost
+        // its history and reused counter values. Treat it as a conflict so
+        // both versions survive instead of each side keeping its own.
+        Causality::Equal if differ => Causality::Concurrent,
+        c => c,
+    };
+    match causality {
         Causality::Equal | Causality::After => Resolution::KeepLocal,
         Causality::Before => Resolution::TakeRemote,
         Causality::Concurrent => match (local.deleted, remote.deleted) {
@@ -307,8 +317,6 @@ mod tests {
         /// Both peers must end up with the same content at the path.
         #[test]
         fn both_sides_agree(l in arb_entry(), r in arb_entry()) {
-            // Equal vectors with different contents cannot happen honestly.
-            prop_assume!(l.version.compare(&r.version) != Causality::Equal);
             prop_assert_eq!(outcome(&l, &r), outcome(&r, &l));
         }
 

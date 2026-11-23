@@ -27,13 +27,14 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
-    /// Turns this entry into a tombstone recording a deletion by `device`.
-    pub fn mark_deleted(&mut self, device: DeviceId) {
+    /// Turns this entry into a tombstone recording a deletion by `device`
+    /// at `now` (ns since the Unix epoch; see `VersionVector::bump`).
+    pub fn mark_deleted(&mut self, device: DeviceId, now: u64) {
         self.deleted = true;
         self.size = 0;
         self.content_hash = Digest::of(&[]);
         self.chunks.clear();
-        self.version.increment(device);
+        self.version.bump(device, now);
         self.modified_by = device;
     }
 }
@@ -86,7 +87,7 @@ mod tests {
             modified_by: a,
             deleted: false,
         };
-        entry.mark_deleted(b);
+        entry.mark_deleted(b, 0);
         assert!(entry.deleted);
         assert_eq!(entry.size, 0);
         assert!(entry.chunks.is_empty());

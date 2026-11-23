@@ -50,3 +50,21 @@ That is fine for 2-3 devices and unbounded in principle. Antisymmetry,
 transitivity and merge laws are property-tested, and the convergence tests
 (brief §6) rely on them. The paper detects conflicts but does not resolve
 them, so resolution is tested separately.
+
+## Amendment (2026-11-23, M6): clock-stamped counters
+
+**Problem found by the M6 audit:** a device that loses its sync history (folder removed and re-added,
+or `state.db` deleted) restarted its counters at 1. A new edit could then carry a vector that peers had
+already seen, so it looked *older* (and was overwritten without a conflict copy) or *equal* (and each
+side silently kept different contents).
+
+**Change:** a device records an edit with `bump(device, now)`, which sets its counter to
+`max(previous + 1, now)`, where `now` is wall-clock nanoseconds. Counters still only grow per entry, so
+every dominance rule above is unchanged. But a value issued after a reset is larger than any value
+issued before it, so post-reset edits appear newer or concurrent, never older. As a second safeguard,
+`resolve` treats *equal* vectors with different contents as a conflict.
+
+**Limits:** this relies on the clock not going backwards across a history loss (it may go backwards
+otherwise without harm, since `previous + 1` still applies). It is in the spirit of hybrid logical
+clocks, but only the per-device counter is clock-stamped. The clock never decides *whether* edits
+conflict; only the vector comparison does. Regression tests: `crates/nebula-sync/tests/reset.rs`.
