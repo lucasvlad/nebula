@@ -189,18 +189,18 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:>10}  {:>6}  {:<8}  {:<16}  PATH",
+                "{:>10}  {:>6}  {:<8}  {:<28}  PATH",
                 "SIZE", "CHUNKS", "CONTENT", "VERSION"
             );
             for e in files {
                 let version: Vec<String> = e
                     .version
                     .iter()
-                    .map(|(d, n)| format!("{}:{n}", d.short()))
+                    .map(|(d, n)| version_stamp(d, *n))
                     .collect();
                 if e.deleted {
                     println!(
-                        "{:>10}  {:>6}  {:<8}  {:<16}  {}",
+                        "{:>10}  {:>6}  {:<8}  {:<28}  {}",
                         "deleted",
                         "",
                         "",
@@ -209,7 +209,7 @@ fn main() -> Result<()> {
                     );
                 } else {
                     println!(
-                        "{:>10}  {:>6}  {:<8}  {:<16}  {}",
+                        "{:>10}  {:>6}  {:<8}  {:<28}  {}",
                         human_bytes(e.size),
                         e.chunks.len(),
                         e.content_hash.short(),
@@ -220,7 +220,7 @@ fn main() -> Result<()> {
             }
             println!();
             println!(
-                "VERSION lists each device that changed a file and how many times \
+                "VERSION lists each device that changed a file and when it last did, in UTC \
                  (this device is {}).",
                 device.short()
             );
@@ -521,6 +521,19 @@ fn group(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+/// One version-vector entry for display. Counters are clock-stamped
+/// (`VersionVector::bump`), so most read as times; older ones are counts.
+fn version_stamp(device: &nebula_core::DeviceId, n: u64) -> String {
+    match i64::try_from(n) {
+        // After 2001-09-09: a nanosecond timestamp, not a small count.
+        Ok(ns) if ns >= 1_000_000_000_000_000_000 => {
+            let t = nebula_core::conflict::format_utc(ns);
+            format!("{}@{}:{}", device.short(), &t[..13], &t[13..15])
+        }
+        _ => format!("{}:{n}", device.short()),
+    }
 }
 
 fn human_bytes(n: u64) -> String {
