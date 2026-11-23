@@ -6,12 +6,12 @@ includes connecting, the handshake, the index exchange and the final hash check.
 
 | File size | Time | Throughput | Peak memory, sender | Peak memory, receiver | Copy identical |
 |---|---|---|---|---|---|
-| 1 MiB | 0.14 s | 7.1 MiB/s | 11.2 MiB | 8.9 MiB | yes |
-| 100 MiB | 0.70 s | 142.8 MiB/s | 17.0 MiB | 13.7 MiB | yes |
-| 1 GiB | 6.62 s | 154.6 MiB/s | 92.1 MiB | 28.6 MiB | yes |
+| 1 MiB | 0.15 s | 6.7 MiB/s | 11.4 MiB | 10.5 MiB | yes |
+| 100 MiB | 1.05 s | 95.4 MiB/s | 17.0 MiB | 14.0 MiB | yes |
+| 1 GiB | 9.62 s | 106.4 MiB/s | 96.8 MiB | 48.7 MiB | yes |
 
 ## Resume after the receiver is killed (kill -9) mid-transfer
 
-- File: 1024 MiB. Partial download on disk when killed: 539.4 MiB (53 %).
-- After restarting the receiver, the copy was complete and byte-identical in 2.87 s.
-- Receiver log: "resuming; 68982 of 130981 chunks" (only the remaining chunks were requested).
+- File: 1024 MiB. Partial download on disk when killed: 522.9 MiB (51 %).
+- After restarting the receiver, the copy was complete and byte-identical in 5.28 s.
+- Receiver log: "resuming; 66607 of 130444 chunks" (only the remaining chunks were requested).
