@@ -115,8 +115,9 @@ fn sanitize_label(label: &str) -> String {
     }
 }
 
-/// `YYYY-MM-DD HHMMSS` in UTC. Colons are not allowed in Windows filenames.
-fn format_utc(ns: i64) -> String {
+/// `YYYY-MM-DD HHMMSS` in UTC. Colons are not allowed in Windows filenames,
+/// which is why conflict copy names use this format.
+pub fn format_utc(ns: i64) -> String {
     let secs = ns.div_euclid(1_000_000_000);
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     let t = secs.rem_euclid(86_400);

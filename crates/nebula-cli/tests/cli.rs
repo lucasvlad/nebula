@@ -91,3 +91,79 @@ fn refuses_folder_containing_its_own_state() {
     let out = nebula(&home, &["add", dir.path().to_str().unwrap()]);
     assert!(!out.status.success());
 }
+
+fn nebula_in(dir: &Path, home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .current_dir(dir)
+        .arg("--home")
+        .arg(home)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn removes_a_deleted_folder_by_relative_path() {
+    let home = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("docs");
+    fs::create_dir(&dir).unwrap();
+    ok(home.path(), &["add", dir.to_str().unwrap(), "--as", "work"]);
+    fs::remove_dir(&dir).unwrap();
+
+    let out = nebula_in(parent.path(), home.path(), &["remove", "docs"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(ok(home.path(), &["folders"]).contains("No synced folders"));
+}
+
+#[test]
+fn removes_a_deleted_folder_by_name() {
+    let home = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("photos");
+    fs::create_dir(&dir).unwrap();
+    ok(
+        home.path(),
+        &["add", dir.to_str().unwrap(), "--as", "Holiday pics"],
+    );
+    fs::remove_dir(&dir).unwrap();
+
+    assert!(ok(home.path(), &["ls", "Holiday pics"]).contains("Nothing recorded"));
+    let out = ok(home.path(), &["remove", "Holiday pics"]);
+    assert!(out.contains("Stopped syncing"), "{out}");
+    assert!(ok(home.path(), &["folders"]).contains("No synced folders"));
+    assert!(
+        !nebula(home.path(), &["remove", "Holiday pics"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn scan_continues_past_a_missing_folder() {
+    let home = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let gone = parent.path().join("a-gone");
+    let here = parent.path().join("b-here");
+    fs::create_dir(&gone).unwrap();
+    fs::create_dir(&here).unwrap();
+    fs::write(here.join("notes.txt"), "hello").unwrap();
+    ok(home.path(), &["add", gone.to_str().unwrap()]);
+    ok(home.path(), &["add", here.to_str().unwrap()]);
+    fs::remove_dir(&gone).unwrap();
+
+    // Folders are scanned in path order, so the missing one comes first.
+    let out = nebula(home.path(), &["scan"]);
+    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("notes.txt"), "{stdout}");
+    assert!(stderr.contains("a-gone"), "{stderr}");
+    assert!(stderr.contains("1 folder could not be scanned"), "{stderr}");
+    // The other folder can still be scanned on its own, by name.
+    assert!(ok(home.path(), &["scan", "b-here"]).contains("No changes"));
+}

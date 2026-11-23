@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use nebula_net::transport::{self, RecvHalf, SendHalf, Session, TransportError};
 use nebula_sync::engine::Input;
 use nebula_sync::protocol::Message;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use super::Daemon;
@@ -32,6 +32,14 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE: Duration = Duration::from_secs(30);
 /// A session that receives nothing for this long is closed.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Messages queued for one peer. A full queue means the peer is not reading
+/// (each reply can be a 64 KiB chunk), so the session is closed rather than
+/// buffering without limit.
+const OUTBOUND: usize = 1024;
+/// Chunk requests a peer may have unanswered. A well-behaved peer keeps at
+/// most 32 in flight per download and runs at most 16 downloads at once
+/// (512); the rest is slack. Past this the peer is not reading our replies.
+const MAX_IN_FLIGHT: usize = 600;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -47,9 +55,37 @@ pub fn keep_new(existing_initiator: &DeviceId, new_initiator: &DeviceId) -> bool
 struct Live {
     id: u64,
     initiator: DeviceId,
-    out: mpsc::UnboundedSender<Message>,
+    out: mpsc::Sender<Message>,
     /// Dropping this closes the session.
     _close: oneshot::Sender<()>,
+}
+
+/// Whether [`Registry::send`] queued a message.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Queued {
+    Yes,
+    NotConnected,
+    /// The peer's queue was full, so its session was closed.
+    Full,
+}
+
+/// Counts a session's chunk requests that have not been answered yet.
+#[derive(Default)]
+struct InFlight(AtomicUsize);
+
+impl InFlight {
+    /// A request arrived. `false` if the peer now has too many unanswered.
+    fn request(&self) -> bool {
+        self.0.fetch_add(1, Ordering::Relaxed) < MAX_IN_FLIGHT
+    }
+
+    /// A reply was sent. Saturates: a reply can belong to a request made on
+    /// an earlier session with the same peer.
+    fn answered(&self) {
+        let _ = self
+            .0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
 }
 
 /// Registered sync sessions, one per peer.
@@ -61,11 +97,23 @@ impl Registry {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Queues `msg` for `peer`. `false` if it is not connected.
-    pub fn send(&self, peer: &DeviceId, msg: Message) -> bool {
-        self.lock()
-            .get(peer)
-            .is_some_and(|live| live.out.send(msg).is_ok())
+    /// Queues `msg` for `peer` without waiting. If its queue is full, the
+    /// session is closed (unregistered here; the caller tells the engine).
+    pub fn send(&self, peer: &DeviceId, msg: Message) -> Queued {
+        let mut map = self.lock();
+        let Some(live) = map.get(peer) else {
+            return Queued::NotConnected;
+        };
+        match live.out.try_send(msg) {
+            Ok(()) => Queued::Yes,
+            // Its task is ending and will unregister it.
+            Err(mpsc::error::TrySendError::Closed(_)) => Queued::NotConnected,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Dropping its close handle ends the session's task.
+                map.remove(peer);
+                Queued::Full
+            }
+        }
     }
 
     pub fn is_live(&self, peer: &DeviceId) -> bool {
@@ -118,9 +166,17 @@ impl Registry {
 }
 
 /// Accepts a connection: handshake with the allowlist, then [`run`].
-pub async fn incoming(d: Arc<Daemon>, stream: TcpStream, addr: SocketAddr) {
+/// `handshake` is held until the peer has proved it is paired.
+pub async fn incoming(
+    d: Arc<Daemon>,
+    stream: TcpStream,
+    addr: SocketAddr,
+    handshake: OwnedSemaphorePermit,
+) {
     let allowed = |key: &[u8; 32]| d.store().is_paired(key).unwrap_or(false);
-    let session = match transport::accept(stream, &d.identity, allowed).await {
+    let accepted = transport::accept(stream, &d.identity, allowed).await;
+    drop(handshake);
+    let session = match accepted {
         Ok(s) => s,
         Err(TransportError::NotAllowed(device)) => {
             warn!(
@@ -181,7 +237,7 @@ async fn drive(
     let first = tokio::time::timeout(HELLO_TIMEOUT, recv(&mut rx))
         .await
         .map_err(|_| anyhow!("it did not say hello within {HELLO_TIMEOUT:?}"))??;
-    let (out_tx, out_rx) = mpsc::unbounded_channel();
+    let (out_tx, out_rx) = mpsc::channel(OUTBOUND);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (closed, pending) = match first {
         Message::Hello { protocol, .. } => {
@@ -218,9 +274,10 @@ async fn drive(
             None => std::future::pending().await,
         }
     };
+    let in_flight = InFlight::default();
     let res = tokio::select! {
-        r = reader(d, &mut rx, &out_tx, peer, peer_name, sync, pending) => r.map(|()| true),
-        r = writer(&mut tx, out_rx) => r.map(|()| true),
+        r = reader(d, &mut rx, &out_tx, &in_flight, peer, peer_name, sync, pending) => r.map(|()| true),
+        r = writer(&mut tx, out_rx, &in_flight) => r.map(|()| true),
         _ = closed => {
             // Replaced by a better session, or the daemon is stopping.
             if d.sessions.is_live(&peer) {
@@ -235,10 +292,12 @@ async fn drive(
     res
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reader(
     d: &Daemon,
     rx: &mut RecvHalf<TcpStream>,
-    out: &mpsc::UnboundedSender<Message>,
+    out: &mpsc::Sender<Message>,
+    in_flight: &InFlight,
     peer: DeviceId,
     peer_name: &str,
     sync: bool,
@@ -255,7 +314,8 @@ async fn reader(
         };
         match msg {
             Message::Ping { nonce } => {
-                let _ = out.send(Message::Pong { nonce });
+                // Dropped if the queue is full; the peer only loses a pong.
+                let _ = out.try_send(Message::Pong { nonce });
             }
             Message::Pong { .. } => {}
             Message::Hello { .. } => debug!("\"{peer_name}\" said hello again; ignored"),
@@ -263,7 +323,15 @@ async fn reader(
                 let text: String = text.chars().filter(|c| !c.is_control()).take(500).collect();
                 info!("\"{peer_name}\" sent a message, decrypted here: \"{text}\"");
             }
-            msg if sync => d.engine.send(Input::Received { peer, msg }),
+            msg if sync => {
+                if matches!(msg, Message::Request { .. }) && !in_flight.request() {
+                    bail!(
+                        "it has more than {MAX_IN_FLIGHT} chunk requests unanswered \
+                         (it is not reading the replies); closing"
+                    );
+                }
+                d.engine.received(peer, msg).await;
+            }
             msg => debug!("ignored {} on a ping session", kind(&msg)),
         }
     }
@@ -273,7 +341,8 @@ async fn reader(
 /// until the session ends (the reader stops, or the registry closes it).
 async fn writer(
     tx: &mut SendHalf<TcpStream>,
-    mut queue: mpsc::UnboundedReceiver<Message>,
+    mut queue: mpsc::Receiver<Message>,
+    in_flight: &InFlight,
 ) -> Result<()> {
     let start = tokio::time::Instant::now() + KEEPALIVE;
     let mut keepalive = tokio::time::interval_at(start, KEEPALIVE);
@@ -288,6 +357,9 @@ async fn writer(
         match send(tx, &msg).await {
             Err(e) if is_too_large(&e) => warn!("not sending a {}: {e}", kind(&msg)),
             r => r?,
+        }
+        if matches!(msg, Message::Chunk { .. } | Message::Missing { .. }) {
+            in_flight.answered();
         }
     }
 }
@@ -363,12 +435,8 @@ mod tests {
     fn live(
         id: u64,
         initiator: DeviceId,
-    ) -> (
-        Live,
-        mpsc::UnboundedReceiver<Message>,
-        oneshot::Receiver<()>,
-    ) {
-        let (out, rx) = mpsc::unbounded_channel();
+    ) -> (Live, mpsc::Receiver<Message>, oneshot::Receiver<()>) {
+        let (out, rx) = mpsc::channel(2);
         let (close, closed) = oneshot::channel();
         (
             Live {
@@ -401,20 +469,23 @@ mod tests {
             Err(oneshot::error::TryRecvError::Closed)
         );
 
-        assert!(reg.send(&peer, Message::Ping { nonce: 9 }));
+        assert_eq!(reg.send(&peer, Message::Ping { nonce: 9 }), Queued::Yes);
         assert_eq!(q3.try_recv().ok(), Some(Message::Ping { nonce: 9 }));
         // The replaced session ending must not unregister its successor.
         reg.unregister(peer, 1, &engine);
         assert!(reg.is_live(&peer));
         reg.unregister(peer, 3, &engine);
         assert!(!reg.is_live(&peer));
-        assert!(!reg.send(&peer, Message::Ping { nonce: 1 }));
+        assert_eq!(
+            reg.send(&peer, Message::Ping { nonce: 1 }),
+            Queued::NotConnected
+        );
 
         let seen: Vec<&str> = inputs
             .try_iter()
             .map(|job| match job {
-                Job::Input(Input::Connected { peer: p }) if p == peer => "connected",
-                Job::Input(Input::Disconnected { peer: p }) if p == peer => "disconnected",
+                Job::Input(Input::Connected { peer: p }, _) if p == peer => "connected",
+                Job::Input(Input::Disconnected { peer: p }, _) if p == peer => "disconnected",
                 _ => "other",
             })
             .collect();
@@ -422,5 +493,40 @@ mod tests {
             seen,
             ["connected", "disconnected", "connected", "disconnected"]
         );
+    }
+
+    #[test]
+    fn full_queue_closes_the_session() {
+        let (engine, _inputs) = EngineHandle::for_test();
+        let reg = Registry::default();
+        let peer = DeviceId([0x66; 32]);
+        let (s, _q, mut closed) = live(1, LOW);
+        assert!(reg.register(peer, s, &engine));
+        // The test queue holds two messages; nothing reads it.
+        assert_eq!(reg.send(&peer, Message::Missing { id: 1 }), Queued::Yes);
+        assert_eq!(reg.send(&peer, Message::Missing { id: 2 }), Queued::Yes);
+        assert_eq!(reg.send(&peer, Message::Missing { id: 3 }), Queued::Full);
+        assert!(!reg.is_live(&peer));
+        assert_eq!(closed.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+    }
+
+    #[test]
+    fn in_flight_requests_are_capped() {
+        let f = InFlight::default();
+        for _ in 0..MAX_IN_FLIGHT {
+            assert!(f.request());
+        }
+        assert!(!f.request());
+        // Answers make room again, and never go below zero.
+        let f = InFlight::default();
+        f.answered();
+        for _ in 0..MAX_IN_FLIGHT {
+            assert!(f.request());
+            f.answered();
+        }
+        for _ in 0..MAX_IN_FLIGHT {
+            assert!(f.request());
+        }
+        assert!(!f.request());
     }
 }

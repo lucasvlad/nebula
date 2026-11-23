@@ -30,7 +30,8 @@ use nebula_sync::engine::Input;
 use nebula_sync::store::{Folder, Store};
 use nebula_sync::watcher::{self, FolderWatcher};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::{debug, info, warn};
 
 use crate::pair;
 use engine::EngineHandle;
@@ -42,6 +43,14 @@ const TICK: Duration = Duration::from_secs(30);
 const REVOKE_CHECK: Duration = Duration::from_secs(5);
 /// How long to let the engine finish its current step when stopping.
 const STOP_GRACE: Duration = Duration::from_secs(5);
+/// Incoming connections still in the secure handshake, i.e. not yet known to
+/// be from a paired device. Each holds a socket for up to the handshake
+/// timeout, so without a cap anyone on the network could use up the
+/// daemon's file descriptors.
+const MAX_HANDSHAKES: usize = 32;
+/// Pause after a failed accept: the usual cause (out of file descriptors)
+/// does not clear at once, and retrying immediately would spin the CPU.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// State shared by the daemon's tasks.
 struct Daemon {
@@ -118,7 +127,8 @@ pub async fn run(
 
     let mut ticks = tokio::time::interval(TICK);
     let mut revocations = tokio::time::interval(REVOKE_CHECK);
-    let mut watched: Option<Vec<(i64, PathBuf)>> = None;
+    let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
+    let mut watched: Option<Vec<Watched>> = None;
     let mut watching: Option<FolderWatcher> = None;
     let result = loop {
         tokio::select! {
@@ -131,10 +141,19 @@ pub async fn run(
                 break Err(anyhow!("sync engine stopped: {}", why.err().unwrap_or_default()));
             }
             accepted = listener.accept() => match accepted {
-                Ok((stream, addr)) => {
-                    tokio::spawn(session::incoming(daemon.clone(), stream, addr));
+                Ok((stream, addr)) => match admit(&handshakes) {
+                    Some(permit) => {
+                        tokio::spawn(session::incoming(daemon.clone(), stream, addr, permit));
+                    }
+                    // Dropping the stream closes it.
+                    None => debug!(
+                        "closed a connection from {addr}: {MAX_HANDSHAKES} handshakes already in progress"
+                    ),
+                },
+                Err(e) => {
+                    warn!("could not accept a connection: {e}");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
                 }
-                Err(e) => warn!("could not accept a connection: {e}"),
             },
             // The first tick fires at once: the startup scan.
             _ = ticks.tick() => {
@@ -168,11 +187,21 @@ pub async fn run(
     result
 }
 
+/// A slot for one more pre-authentication handshake, if there is room.
+fn admit(handshakes: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    handshakes.clone().try_acquire_owned().ok()
+}
+
+/// A folder as last watched: ID, root, and whether the root existed then.
+type Watched = (i64, PathBuf, bool);
+
 /// (Re)starts the watcher if the folder list changed since last time
-/// (`nebula add` / `nebula remove` while running).
+/// (`nebula add` / `nebula remove` while running), or a root appeared or
+/// disappeared (a USB drive plugged back in). The watcher skips roots it
+/// cannot watch, so a missing root is only watched once it exists again.
 fn refreshwatching(
     daemon: &Arc<Daemon>,
-    watched: &mut Option<Vec<(i64, PathBuf)>>,
+    watched: &mut Option<Vec<Watched>>,
     current: &mut Option<FolderWatcher>,
 ) {
     let folders: Vec<Folder> = match daemon.store().folders() {
@@ -182,7 +211,10 @@ fn refreshwatching(
             return;
         }
     };
-    let now: Vec<(i64, PathBuf)> = folders.iter().map(|f| (f.id, f.root.clone())).collect();
+    let now: Vec<Watched> = folders
+        .iter()
+        .map(|f| (f.id, f.root.clone(), f.root.is_dir()))
+        .collect();
     if watched.as_ref() == Some(&now) {
         return;
     }
@@ -202,5 +234,21 @@ fn refreshwatching(
         }
         // Retried next tick; the periodic rescan still catches changes.
         Err(e) => warn!("{e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handshakes_are_capped() {
+        let sem = Arc::new(Semaphore::new(MAX_HANDSHAKES));
+        let held: Vec<_> = (0..MAX_HANDSHAKES).filter_map(|_| admit(&sem)).collect();
+        assert_eq!(held.len(), MAX_HANDSHAKES);
+        assert!(admit(&sem).is_none());
+        // A finished handshake frees its slot.
+        drop(held);
+        assert!(admit(&sem).is_some());
     }
 }
