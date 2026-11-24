@@ -400,7 +400,10 @@ function describe(ev) {
   const where = (folder, path) => h('span', { class: 'where' }, `${folder} / ${path}`);
   switch (ev.kind) {
     case 'peer_online':
-      return { icon: 'link', tone: 'good', text: [h('strong', {}, ev.name), ` connected directly at ${hostOf(ev.address)}. The connection is encrypted.`],
+      // Keyed per device: if both devices dialled at once, the session that
+      // survives replaces the first entry, so the words shown are always the
+      // ones the other screen shows too.
+      return { key: `online:${ev.id}`, icon: 'link', tone: 'good', text: [h('strong', {}, ev.name), ` connected directly at ${hostOf(ev.address)}. The connection is encrypted.`],
         extra: h('div', { class: 'entry-words' }, words(ev.security_code), h('span', { class: 'hint' }, 'Same words on both screens means no one is in the middle.')) };
     case 'peer_offline':
       return { icon: 'unlink', tone: 'quiet', text: [h('strong', {}, ev.name), ' disconnected.'] };

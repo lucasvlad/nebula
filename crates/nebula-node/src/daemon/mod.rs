@@ -127,6 +127,11 @@ impl Running {
             .map_err(|e| anyhow!("daemon task failed: {e}"))?
     }
 
+    /// Asks the daemon to stop without waiting for it.
+    pub(crate) fn request_stop(&self) {
+        self.stop.notify_one();
+    }
+
     /// Waits until the daemon stops on its own (the sync engine failed).
     pub(crate) async fn stopped(&mut self) -> Result<()> {
         (&mut self.main)

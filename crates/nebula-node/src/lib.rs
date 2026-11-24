@@ -296,6 +296,14 @@ impl Node {
         self.running.stopped().await
     }
 
+    /// Asks the node to stop without waiting, for an app that is exiting
+    /// and cannot give up its handle. Connections close and the engine
+    /// finishes its current step.
+    pub fn request_stop(&self) {
+        self.pair_cancel_quietly();
+        self.running.request_stop();
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         self.pair_cancel_quietly();
         self.running.shutdown().await
