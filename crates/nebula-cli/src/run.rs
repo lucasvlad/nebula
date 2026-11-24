@@ -7,14 +7,14 @@ use anyhow::{Result, anyhow, bail};
 use nebula_net::discovery;
 use nebula_net::identity::Identity;
 use nebula_net::transport::{self, Session, TransportError};
-use nebula_sync::protocol::{Message, PROTOCOL_VERSION};
+use nebula_sync::protocol::Message;
 use nebula_sync::store::Store;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::pair;
+use nebula_node::net::{self, RUN_PORT, check_protocol, is_closed};
 
 /// Port `nebula run` listens on.
-pub const RUN_PORT: u16 = 7878;
 const FIND_TIME: Duration = Duration::from_secs(4);
 
 pub async fn ping(
@@ -29,7 +29,7 @@ pub async fn ping(
         bail!("this device is not paired with anything yet. Pair first with `nebula pair`");
     }
     let target = match who {
-        Some(who) => Some(pair::find_peer(&store, who)?),
+        Some(who) => Some(net::find_peer(&store, who)?),
         None if addr.is_some() => None,
         None => match store.peers()?.as_slice() {
             [only] => Some(only.clone()),
@@ -38,7 +38,7 @@ pub async fn ping(
     };
 
     let addrs = match (addr, &target) {
-        (Some(addr), _) => pair::resolve(addr, RUN_PORT).await?,
+        (Some(addr), _) => net::resolve(addr, RUN_PORT).await?,
         (None, Some(peer)) => {
             println!("Looking for \"{}\" on the local network...", peer.name);
             match discovery::find_device(&peer.device_id, FIND_TIME).await? {
@@ -46,7 +46,7 @@ pub async fn ping(
                 None => match &peer.last_addr {
                     Some(last) => {
                         println!("Not announced; trying its last address, {last}.");
-                        pair::resolve(last, RUN_PORT).await?
+                        net::resolve(last, RUN_PORT).await?
                     }
                     None => bail!(
                         "could not find \"{}\". Make sure `nebula run` is running on it, \
@@ -59,7 +59,7 @@ pub async fn ping(
         (None, None) => bail!("pass a device name or --addr"),
     };
 
-    let stream = pair::connect_any(&addrs).await?;
+    let stream = net::connect_any(&addrs).await?;
     let remote = stream.peer_addr()?;
     // With a named target only that device may answer; with a bare --addr,
     // any paired device may.
@@ -124,23 +124,6 @@ pub async fn ping(
     Ok(())
 }
 
-pub(crate) fn hello(name: &str) -> Message {
-    Message::Hello {
-        name: name.to_string(),
-        protocol: PROTOCOL_VERSION,
-    }
-}
-
-pub(crate) fn check_protocol(theirs: u32) -> Result<()> {
-    if theirs != PROTOCOL_VERSION {
-        bail!(
-            "the other device speaks protocol version {theirs}, this one {PROTOCOL_VERSION}; \
-             update Nebula on both"
-        );
-    }
-    Ok(())
-}
-
 async fn send<S: AsyncRead + AsyncWrite + Unpin>(s: &mut Session<S>, m: &Message) -> Result<()> {
     s.send(&m.encode()).await?;
     Ok(())
@@ -149,17 +132,6 @@ async fn send<S: AsyncRead + AsyncWrite + Unpin>(s: &mut Session<S>, m: &Message
 async fn recv<S: AsyncRead + AsyncWrite + Unpin>(s: &mut Session<S>) -> Result<Message> {
     let bytes = s.recv().await?;
     Message::decode(&bytes).map_err(|e| anyhow!("peer sent a malformed message: {e}"))
-}
-
-pub(crate) fn is_closed(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-    )
-}
-
-pub(crate) fn is_hangup(e: &anyhow::Error) -> bool {
-    matches!(e.downcast_ref::<TransportError>(), Some(TransportError::Io(io)) if is_closed(io))
 }
 
 fn explain_refusal(e: TransportError, named_target: bool) -> anyhow::Error {

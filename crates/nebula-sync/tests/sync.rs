@@ -234,6 +234,60 @@ fn initial_sync_copies_everything() {
 }
 
 #[test]
+fn events_describe_what_happened() {
+    use nebula_sync::engine::Event;
+    let mut a = Dev::new(1, "A");
+    let mut b = Dev::new(2, "B");
+    let mut big = noise(3_000_000, 21);
+    a.write("big.bin", &big);
+    a.scan();
+    assert!(matches!(
+        a.engine.take_events()[..],
+        [Event::LocalChange { added: 1, .. }]
+    ));
+    connect(&mut a, &mut b);
+    let ev = b.engine.take_events();
+    assert!(ev.iter().any(|e| matches!(
+        e,
+        Event::Progress {
+            total: 3_000_000,
+            ..
+        }
+    )));
+    assert!(ev.iter().any(|e| matches!(
+        e,
+        Event::FileReceived {
+            size: 3_000_000,
+            transferred: 3_000_000,
+            ..
+        }
+    )));
+
+    // A small edit: the event reports how little crossed the network.
+    big[1_500_000] ^= 1;
+    a.write("big.bin", &big);
+    change_on(&mut a, &mut b);
+    let Some(Event::FileReceived { transferred, .. }) = b
+        .engine
+        .take_events()
+        .into_iter()
+        .find(|e| matches!(e, Event::FileReceived { .. }))
+    else {
+        panic!("no FileReceived event");
+    };
+    assert!(transferred < 150_000, "transferred {transferred}");
+
+    fs::remove_file(a.path("big.bin")).unwrap();
+    change_on(&mut a, &mut b);
+    assert!(
+        b.engine
+            .take_events()
+            .iter()
+            .any(|e| matches!(e, Event::FileDeleted { from, .. } if *from == a.id))
+    );
+}
+
+#[test]
 fn small_edit_sends_only_changed_chunks() {
     let mut a = Dev::new(1, "A");
     let mut b = Dev::new(2, "B");

@@ -1,0 +1,29 @@
+[package]
+name = "nebula-app"
+description = "The Nebula desktop app: the same node as `nebula run`, with a window."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "nebula-app"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.105"
+nebula-node = { version = "0.1.0", path = "../nebula-node" }
+serde = { version = "1.0.229", features = ["derive"] }
+tauri = "2.12"
+tauri-plugin-dialog = "2.8"
+tokio = { version = "1.54.1", features = ["sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "ansi"] }
+
+[build-dependencies]
+tauri-build = "2.7"
+
+[lints]
+workspace = true

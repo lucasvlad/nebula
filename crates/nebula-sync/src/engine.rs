@@ -100,6 +100,52 @@ impl Known {
     }
 }
 
+/// Something a user would want to see, for the app's activity feed.
+/// Collected during [`Engine::handle`] and drained with
+/// [`Engine::take_events`]; the engine never depends on anyone reading them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// This device's scan found changes, which are being announced.
+    LocalChange {
+        folder: String,
+        added: usize,
+        modified: usize,
+        deleted: usize,
+    },
+    /// A download advanced by at least 1 % (files over 1 MiB only).
+    Progress {
+        folder: String,
+        path: RelPath,
+        from: DeviceId,
+        done: u64,
+        total: u64,
+    },
+    /// A file arrived. `transferred` is the chunk data that crossed the
+    /// network; the rest was reused from files already here.
+    FileReceived {
+        folder: String,
+        path: RelPath,
+        from: DeviceId,
+        size: u64,
+        transferred: u64,
+    },
+    /// Deleted here because the other device deleted it.
+    FileDeleted {
+        folder: String,
+        path: RelPath,
+        from: DeviceId,
+    },
+    /// Both devices edited `path`; this device's version was kept as `copy`.
+    Conflict {
+        folder: String,
+        path: RelPath,
+        copy: RelPath,
+    },
+}
+
+/// Files smaller than this arrive too fast for progress to be worth showing.
+const PROGRESS_MIN_SIZE: u64 = 1024 * 1024;
+
 /// A file being assembled from local and remote chunks.
 struct Download {
     folder: Folder,
@@ -115,6 +161,11 @@ struct Download {
     hasher: blake3::Hasher,
     /// Chunks written to the temp file so far, in order.
     written: usize,
+    /// Bytes written so far, and how many of them came over the network.
+    done: u64,
+    fetched: u64,
+    /// Last progress reported, in percent.
+    reported: u8,
     /// Next chunk index to consider requesting ahead.
     cursor: usize,
     inflight: usize,
@@ -218,6 +269,7 @@ pub struct Engine {
     /// that may later name a different folder.
     folders_seen: HashMap<i64, (String, PathBuf)>,
     out: Vec<Output>,
+    events: Vec<Event>,
 }
 
 impl Engine {
@@ -239,6 +291,7 @@ impl Engine {
             known: HashMap::new(),
             folders_seen,
             out: Vec::new(),
+            events: Vec::new(),
         })
     }
 
@@ -248,6 +301,20 @@ impl Engine {
     }
 
     /// Downloads not yet finished, for status display and tests.
+    /// Events since the last call, oldest first.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// A paired device's name, for messages about it.
+    pub fn peer_name(&self, device: &DeviceId) -> String {
+        self.store
+            .peer(device)
+            .ok()
+            .flatten()
+            .map_or_else(|| device.short(), |p| p.name)
+    }
+
     pub fn pending_downloads(&self) -> usize {
         self.downloads.len() + self.queued.len()
     }
@@ -619,6 +686,11 @@ impl Engine {
                     "{}: deleted, because it was deleted on the other device",
                     theirs.path
                 );
+                self.events.push(Event::FileDeleted {
+                    folder: folder.label.clone(),
+                    path: theirs.path.clone(),
+                    from: peer,
+                });
             }
             let mut entry = theirs.clone();
             if let Some(o) = &ours {
@@ -739,6 +811,10 @@ impl Engine {
                 file,
                 hasher,
                 written,
+                // A resumed prefix counts as done but was not fetched now.
+                done: offset,
+                fetched: 0,
+                reported: 0,
                 cursor: written,
                 inflight: 0,
                 requested: HashSet::new(),
@@ -771,6 +847,7 @@ impl Engine {
             Some(data)
                 if data.len() == expected.len as usize && Digest::of(&data) == expected.hash =>
             {
+                d.fetched += data.len() as u64;
                 d.received.insert(req.index, data);
             }
             Some(_) => {
@@ -845,6 +922,19 @@ impl Engine {
             d.hasher.update(&data);
             d.written += 1;
             d.cursor = d.cursor.max(d.written);
+            d.done += data.len() as u64;
+            let total = d.want.size;
+            let pct = u8::try_from(d.done * 100 / total.max(1)).unwrap_or(100);
+            if total >= PROGRESS_MIN_SIZE && pct > d.reported && pct < 100 {
+                d.reported = pct;
+                self.events.push(Event::Progress {
+                    folder: d.folder.label.clone(),
+                    path: d.want.path.clone(),
+                    from: d.from,
+                    done: d.done,
+                    total,
+                });
+            }
         }
 
         // Keep a window of requests in flight, skipping chunks we can copy
@@ -948,6 +1038,11 @@ impl Engine {
             }
             fs::rename(&target, &copy_path)?;
             info!("{path}: this device's version was kept as \"{copy}\"");
+            self.events.push(Event::Conflict {
+                folder: d.folder.label.clone(),
+                path: path.clone(),
+                copy: copy.clone(),
+            });
         }
         fs::rename(&d.temp, &target)?;
 
@@ -966,6 +1061,13 @@ impl Engine {
             debug!("{path}: already identical; recorded the other device's version history");
         } else {
             info!("{path}: updated from the other device");
+            self.events.push(Event::FileReceived {
+                folder: d.folder.label.clone(),
+                path: path.clone(),
+                from: d.from,
+                size: entry.size,
+                transferred: d.fetched,
+            });
         }
         if d.loser_copy.is_some() {
             // Index the conflict copy so it syncs too.
@@ -1014,6 +1116,12 @@ impl Engine {
         }
         self.locators.remove(&folder.id);
         if report.has_changes() {
+            self.events.push(Event::LocalChange {
+                folder: folder.label.clone(),
+                added: report.added.len(),
+                modified: report.modified.len(),
+                deleted: report.deleted.len(),
+            });
             info!(
                 "\"{}\": {} added, {} modified, {} deleted on this device",
                 folder.label,
