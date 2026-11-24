@@ -12,16 +12,16 @@ use nebula_net::transport;
 use tracing::{debug, info};
 
 use super::{Daemon, session};
-use crate::pair;
-use crate::run::RUN_PORT;
+use crate::net::{self, RUN_PORT};
 
 const EVERY: Duration = Duration::from_secs(10);
 /// Kept short: this runs for every disconnected peer on every round.
 const FIND_TIME: Duration = Duration::from_secs(2);
 
-/// `explicit` are `--connect` addresses. They may answer as any paired
-/// device; once one has, it is skipped while that device is connected.
-pub async fn run(d: Arc<Daemon>, explicit: Vec<String>) {
+/// Explicit addresses (`--connect`, or added from the app) may answer as
+/// any paired device; once one has, it is skipped while that device is
+/// connected.
+pub async fn run(d: Arc<Daemon>) {
     let mut known: HashMap<String, DeviceId> = HashMap::new();
     let mut ticks = tokio::time::interval(EVERY);
     loop {
@@ -34,6 +34,7 @@ pub async fn run(d: Arc<Daemon>, explicit: Vec<String>) {
             }
         };
         let mut dialled: HashSet<DeviceId> = HashSet::new();
+        let explicit = d.explicit_addrs();
 
         for addr in &explicit {
             let wanted = match known.get(addr) {
@@ -44,7 +45,7 @@ pub async fn run(d: Arc<Daemon>, explicit: Vec<String>) {
                 continue;
             }
             let keys: Vec<[u8; 32]> = peers.iter().map(|p| p.public_key).collect();
-            match pair::resolve(addr, RUN_PORT).await {
+            match net::resolve(addr, RUN_PORT).await {
                 Ok(addrs) => match dial(&d, &addrs, &keys).await {
                     Ok(dev) => {
                         known.insert(addr.clone(), dev);
@@ -69,7 +70,7 @@ pub async fn run(d: Arc<Daemon>, explicit: Vec<String>) {
                 }
             };
             if let Some(last) = &peer.last_addr
-                && let Ok(last) = pair::resolve(last, RUN_PORT).await
+                && let Ok(last) = net::resolve(last, RUN_PORT).await
             {
                 for a in last {
                     if !addrs.contains(&a) {
@@ -91,7 +92,7 @@ pub async fn run(d: Arc<Daemon>, explicit: Vec<String>) {
 /// Connects to the first address that answers, as the initiator, accepting
 /// only the given keys, and starts the session.
 async fn dial(d: &Arc<Daemon>, addrs: &[SocketAddr], keys: &[[u8; 32]]) -> Result<DeviceId> {
-    let stream = pair::connect_any(addrs).await?;
+    let stream = net::connect_any(addrs).await?;
     let remote = stream.peer_addr()?;
     let session = transport::connect(stream, &d.identity, |k| keys.contains(k)).await?;
     let device = session.remote_device();

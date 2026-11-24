@@ -1,15 +1,14 @@
 //! The `nebula` command-line tool.
 
-mod daemon;
 mod pair;
 mod run;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use nebula_net::identity::Identity;
+use nebula_node::{Node, NodeConfig, default_home, identity, open_store};
 use nebula_sync::scanner::{self, ScanReport};
 use nebula_sync::store::{Folder, Store};
 
@@ -69,7 +68,7 @@ enum Command {
         #[arg(long, value_name = "HOST[:PORT]")]
         addr: Option<String>,
         /// Port to listen on while showing a code.
-        #[arg(long, default_value_t = pair::PAIR_PORT)]
+        #[arg(long, default_value_t = nebula_node::net::PAIR_PORT)]
         port: u16,
     },
     /// Show or change the name other devices see for this one.
@@ -80,7 +79,7 @@ enum Command {
     Unpair { device: String },
     /// Run Nebula: stay connected to paired devices and sync folders with them.
     Run {
-        #[arg(long, default_value_t = run::RUN_PORT)]
+        #[arg(long, default_value_t = nebula_node::net::RUN_PORT)]
         port: u16,
         /// Also connect to a paired device at this address (repeatable), for
         /// networks where devices cannot find each other automatically.
@@ -239,24 +238,20 @@ fn main() -> Result<()> {
             let store = open_store(&home)?;
             match new_name {
                 Some(name) => {
-                    let name = pair::set_device_name(&store, &name)?;
+                    let name = nebula_node::net::set_device_name(&store, &name)?;
                     println!("This device is now called \"{name}\".");
                     println!(
                         "Devices you pair with from now on will see this name. \
                          Already-paired devices keep the old one until you pair again."
                     );
                 }
-                None => println!("{}", pair::device_name(&store)?),
+                None => println!("{}", nebula_node::net::device_name(&store)?),
             }
         }
         Command::Peers => pair::list(&open_store(&home)?)?,
         Command::Unpair { device } => pair::unpair(&open_store(&home)?, &device)?,
         Command::Run { port, connect } => {
-            let identity = identity(&home)?;
-            let store = open_store(&home)?;
-            let db = home.join("state.db");
-            tokio::runtime::Runtime::new()?
-                .block_on(daemon::run(identity, store, &db, port, connect))?;
+            tokio::runtime::Runtime::new()?.block_on(serve(home, port, connect))?;
         }
         Command::Ping {
             device,
@@ -279,65 +274,51 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn default_home() -> Result<PathBuf> {
-    directories::ProjectDirs::from("", "", "nebula")
-        .map(|d| d.data_dir().to_path_buf())
-        .context("could not find a home directory; pass --home")
-}
-
-fn identity(home: &Path) -> Result<Identity> {
-    let path = home.join("identity.key");
-    Identity::load_or_create(&path).with_context(|| format!("loading {}", path.display()))
-}
-
-fn open_store(home: &Path) -> Result<Store> {
-    std::fs::create_dir_all(home).with_context(|| format!("creating {}", home.display()))?;
-    let path = home.join("state.db");
-    Store::open(&path).with_context(|| format!("opening {}", path.display()))
-}
-
 fn add(home: &Path, folder: &Path, label: Option<&str>) -> Result<()> {
-    let root = std::fs::canonicalize(folder)
-        .with_context(|| format!("{} does not exist", folder.display()))?;
-    if !root.is_dir() {
-        bail!("{} is not a folder", root.display());
-    }
     let store = open_store(home)?;
-    // Nebula's own state must not sync, or every write would trigger a sync.
-    let home = std::fs::canonicalize(home)?;
-    if home.starts_with(&root) {
-        bail!(
-            "{} contains Nebula's own data folder ({})",
-            root.display(),
-            home.display()
-        );
-    }
-    for other in store.folders()? {
-        if root.starts_with(&other.root) || other.root.starts_with(&root) {
-            bail!(
-                "{} overlaps the synced folder {}",
-                root.display(),
-                other.root.display()
-            );
-        }
-    }
-    let label = match label {
-        Some(l) => l.trim().to_string(),
-        None => root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "root".to_string()),
-    };
-    if label.is_empty() || label.len() > 64 || label.chars().any(char::is_control) {
-        bail!("folder names must be 1 to 64 characters");
-    }
-    store.add_folder(&root, &label)?;
+    let f = nebula_node::add_folder(&store, home, folder, label)?;
     println!(
-        "Now syncing {} as \"{label}\". On your other devices, add a folder with \
-         the same name (`nebula add <folder> --as \"{label}\"`) to sync them.",
-        root.display()
+        "Now syncing {} as \"{}\". On your other devices, add a folder with \
+         the same name (`nebula add <folder> --as \"{}\"`) to sync them.",
+        f.root.display(),
+        f.label,
+        f.label
     );
     Ok(())
+}
+
+/// `nebula run`: the same node the app runs, narrated to the terminal.
+async fn serve(home: PathBuf, port: u16, connect: Vec<String>) -> Result<()> {
+    let mut node = Node::start(NodeConfig {
+        home,
+        port,
+        connect,
+    })
+    .await?;
+    let status = node.status()?;
+    let peers = status.peers.len();
+    println!(
+        "Nebula is running as \"{}\" (device {}) on port {}, with {peers} paired device{}.",
+        status.me.name,
+        status.me.id,
+        node.port(),
+        if peers == 1 { "" } else { "s" }
+    );
+    if let Some(ip) = status.me.addresses.first() {
+        println!("Other devices can reach it at {ip}:{}.", node.port());
+    }
+    println!("Press Ctrl+C to stop.");
+    let failed = tokio::select! {
+        _ = tokio::signal::ctrl_c() => None,
+        r = node.stopped() => Some(r),
+    };
+    match failed {
+        Some(result) => result,
+        None => {
+            println!("Stopping.");
+            node.shutdown().await
+        }
+    }
 }
 
 /// Finds a synced folder by name, or by path. The path may be relative, and

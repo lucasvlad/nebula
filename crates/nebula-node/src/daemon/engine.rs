@@ -13,19 +13,24 @@
 //! also locks to route outputs, so a blocking send there could deadlock.
 
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use nebula_core::DeviceId;
-use nebula_sync::engine::{Engine, Input};
+use nebula_sync::engine::{Engine, Event, Input};
 use nebula_sync::protocol::Message;
 use nebula_sync::store::Store;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, oneshot};
 use tracing::{debug, warn};
 
 use super::session::{Queued, Registry};
+use crate::events::{EventKind, UiEvent};
+
+/// At most this often per file, so a fast transfer doesn't flood the UI.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
 /// Peer messages queued for the engine at once, across all sessions.
 const MAX_RECEIVED: usize = 4096;
@@ -90,14 +95,17 @@ pub fn spawn(
     me: DeviceId,
     name: String,
     sessions: Registry,
+    events: broadcast::Sender<UiEvent>,
 ) -> Result<(EngineHandle, oneshot::Receiver<Stopped>)> {
     let (tx, rx) = mpsc::channel();
     let (done_tx, done_rx) = oneshot::channel();
     std::thread::Builder::new()
         .name("sync-engine".into())
         .spawn(move || {
-            let res = catch_unwind(AssertUnwindSafe(|| drive(store, me, name, &rx, &sessions)))
-                .unwrap_or_else(|panic| Err(format!("it crashed: {}", panic_message(&*panic))));
+            let res = catch_unwind(AssertUnwindSafe(|| {
+                drive(store, me, name, &rx, &sessions, &events)
+            }))
+            .unwrap_or_else(|panic| Err(format!("it crashed: {}", panic_message(&*panic))));
             let _ = done_tx.send(res);
         })?;
     Ok((EngineHandle::new(tx), done_rx))
@@ -109,9 +117,11 @@ fn drive(
     name: String,
     rx: &mpsc::Receiver<Job>,
     sessions: &Registry,
+    events: &broadcast::Sender<UiEvent>,
 ) -> Stopped {
     let mut engine = Engine::new(store, me, name).map_err(|e| format!("could not start: {e}"))?;
     let mut inputs = VecDeque::new();
+    let mut last_progress = HashMap::new();
     while let Ok(Job::Input(input, permit)) = rx.recv() {
         inputs.push_back(input);
         while let Some(input) = inputs.pop_front() {
@@ -134,10 +144,100 @@ fn drive(
                     }
                 }
             }
+            publish(&mut engine, events, &mut last_progress);
         }
         drop(permit);
     }
     Ok(())
+}
+
+/// Forwards the engine's events to whoever is listening (the app). Sending
+/// never blocks; with no listener the events are simply dropped.
+fn publish(
+    engine: &mut Engine,
+    events: &broadcast::Sender<UiEvent>,
+    last_progress: &mut HashMap<(String, String), Instant>,
+) {
+    let mut changed = false;
+    for event in engine.take_events() {
+        let kind = match event {
+            Event::LocalChange {
+                folder,
+                added,
+                modified,
+                deleted,
+            } => {
+                changed = true;
+                EventKind::LocalChange {
+                    folder,
+                    added,
+                    modified,
+                    deleted,
+                }
+            }
+            Event::Progress {
+                folder,
+                path,
+                from,
+                done,
+                total,
+            } => {
+                let key = (folder.clone(), path.to_string());
+                let now = Instant::now();
+                if last_progress
+                    .get(&key)
+                    .is_some_and(|t| now.duration_since(*t) < PROGRESS_EVERY)
+                {
+                    continue;
+                }
+                last_progress.insert(key, now);
+                EventKind::DownloadProgress {
+                    folder,
+                    path: path.to_string(),
+                    done,
+                    total,
+                    from: engine.peer_name(&from),
+                }
+            }
+            Event::FileReceived {
+                folder,
+                path,
+                from,
+                size,
+                transferred,
+            } => {
+                changed = true;
+                last_progress.remove(&(folder.clone(), path.to_string()));
+                EventKind::FileReceived {
+                    folder,
+                    path: path.to_string(),
+                    from: engine.peer_name(&from),
+                    size,
+                    transferred,
+                }
+            }
+            Event::FileDeleted { folder, path, from } => {
+                changed = true;
+                EventKind::FileDeleted {
+                    folder,
+                    path: path.to_string(),
+                    from: engine.peer_name(&from),
+                }
+            }
+            Event::Conflict { folder, path, copy } => {
+                changed = true;
+                EventKind::Conflict {
+                    folder,
+                    path: path.to_string(),
+                    copy: copy.to_string(),
+                }
+            }
+        };
+        let _ = events.send(UiEvent::now(kind));
+    }
+    if changed {
+        let _ = events.send(UiEvent::now(EventKind::StatusChanged));
+    }
 }
 
 fn panic_message(panic: &(dyn Any + Send)) -> String {

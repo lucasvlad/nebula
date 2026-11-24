@@ -1,5 +1,5 @@
-//! `nebula run`: the daemon that keeps paired devices connected and feeds
-//! the sync engine.
+//! The daemon that keeps paired devices connected and feeds the sync
+//! engine. Started by [`crate::Node`], for `nebula run` and for the app.
 //!
 //! ```text
 //!  watcher ──LocalChange──┐
@@ -17,7 +17,6 @@ mod connector;
 mod engine;
 mod session;
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -30,12 +29,14 @@ use nebula_sync::engine::Input;
 use nebula_sync::store::{Folder, Store};
 use nebula_sync::watcher::{self, FolderWatcher};
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, broadcast};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::pair;
+use crate::events::{EventKind, UiEvent};
+use crate::net;
 use engine::EngineHandle;
-use session::Registry;
+pub(crate) use session::Registry;
 
 /// How often to rescan everything and check for added or removed folders.
 const TICK: Duration = Duration::from_secs(30);
@@ -53,78 +54,151 @@ const MAX_HANDSHAKES: usize = 32;
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// State shared by the daemon's tasks.
-struct Daemon {
-    identity: Identity,
-    me: DeviceId,
-    name: String,
+pub(crate) struct Daemon {
+    pub(crate) identity: Identity,
+    pub(crate) me: DeviceId,
+    pub(crate) name: String,
+    pub(crate) port: u16,
     /// For allowlist checks and peer lookups. The engine has its own connection.
-    store: Mutex<Store>,
-    engine: EngineHandle,
-    sessions: Registry,
+    pub(crate) store: Mutex<Store>,
+    pub(crate) engine: EngineHandle,
+    pub(crate) sessions: Registry,
+    pub(crate) events: broadcast::Sender<UiEvent>,
+    /// Addresses to dial even without discovery (`--connect`, or the app).
+    explicit: Mutex<Vec<String>>,
+    /// Re-check folders and watches now rather than on the next tick.
+    refresh: Notify,
 }
 
 impl Daemon {
-    fn store(&self) -> MutexGuard<'_, Store> {
+    pub(crate) fn store(&self) -> MutexGuard<'_, Store> {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn peer_name(&self, device: &DeviceId) -> String {
+    pub(crate) fn peer_name(&self, device: &DeviceId) -> String {
         self.store()
             .peer(device)
             .ok()
             .flatten()
             .map_or_else(|| device.short(), |p| p.name)
     }
+
+    /// Tells listeners (the app) about something. Never blocks.
+    pub(crate) fn emit(&self, kind: EventKind) {
+        let _ = self.events.send(UiEvent::now(kind));
+    }
+
+    pub(crate) fn explicit_addrs(&self) -> Vec<String> {
+        self.explicit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn add_explicit(&self, addr: String) {
+        let mut list = self.explicit.lock().unwrap_or_else(PoisonError::into_inner);
+        if !list.contains(&addr) {
+            list.push(addr);
+        }
+    }
+
+    pub(crate) fn refresh_now(&self) {
+        self.refresh.notify_one();
+    }
+
+    pub(crate) fn nudge(&self, input: Input) {
+        self.engine.send(input);
+    }
 }
 
-/// Runs until Ctrl+C, or until the sync engine stops (an error).
-pub async fn run(
+/// The running daemon: shared state, its main task, and a stop signal.
+pub(crate) struct Running {
+    pub(crate) daemon: Arc<Daemon>,
+    stop: Arc<Notify>,
+    main: JoinHandle<Result<()>>,
+}
+
+impl Running {
+    /// Asks the daemon to stop and waits for it (and the engine) to finish.
+    pub(crate) async fn shutdown(self) -> Result<()> {
+        self.stop.notify_one();
+        self.main
+            .await
+            .map_err(|e| anyhow!("daemon task failed: {e}"))?
+    }
+
+    /// Waits until the daemon stops on its own (the sync engine failed).
+    pub(crate) async fn stopped(&mut self) -> Result<()> {
+        (&mut self.main)
+            .await
+            .map_err(|e| anyhow!("daemon task failed: {e}"))?
+    }
+}
+
+/// Binds the port, announces this device, and starts the daemon in the
+/// background. Fails if the port is taken (another Nebula running).
+pub(crate) async fn start(
     identity: Identity,
     store: Store,
     db: &Path,
     port: u16,
     connect: Vec<String>,
-) -> Result<()> {
+    events: broadcast::Sender<UiEvent>,
+) -> Result<Running> {
     let me = identity.device_id();
-    let name = pair::device_name(&store)?;
+    let name = net::device_name(&store)?;
     let listener = TcpListener::bind(("0.0.0.0", port))
         .await
         .with_context(|| format!("could not listen on port {port}; is Nebula already running?"))?;
-    let _advert = match discovery::advertise(ServiceKind::Sync, &me, port) {
+    let port = listener.local_addr()?.port();
+    let advert = match discovery::advertise(ServiceKind::Sync, &me, port) {
         Ok(a) => Some(a),
         Err(e) => {
             warn!("could not announce on the local network ({e}); peers will need --connect");
             None
         }
     };
-    let peers = store.peers()?.len();
-    println!(
-        "Nebula is running as \"{name}\" (device {}) on port {port}, with {peers} paired device{}.",
-        me.short(),
-        if peers == 1 { "" } else { "s" }
-    );
-    if let Some(ip) = pair::local_ips().first() {
-        println!(
-            "Other devices can reach it at {}.",
-            SocketAddr::new(*ip, port)
-        );
-    }
-    println!("Press Ctrl+C to stop.");
 
     let engine_store = Store::open(db).with_context(|| format!("opening {}", db.display()))?;
     let sessions = Registry::default();
-    let (engine, mut engine_done) =
-        engine::spawn(engine_store, me, name.clone(), sessions.clone())?;
+    let (engine, engine_done) = engine::spawn(
+        engine_store,
+        me,
+        name.clone(),
+        sessions.clone(),
+        events.clone(),
+    )?;
     let daemon = Arc::new(Daemon {
         identity,
         me,
         name,
+        port,
         store: Mutex::new(store),
         engine,
         sessions,
+        events,
+        explicit: Mutex::new(connect),
+        refresh: Notify::new(),
     });
-    let connector = tokio::spawn(connector::run(daemon.clone(), connect));
+    let stop = Arc::new(Notify::new());
+    let main = tokio::spawn(main_loop(
+        daemon.clone(),
+        listener,
+        engine_done,
+        stop.clone(),
+        advert,
+    ));
+    Ok(Running { daemon, stop, main })
+}
 
+async fn main_loop(
+    daemon: Arc<Daemon>,
+    listener: TcpListener,
+    mut engine_done: tokio::sync::oneshot::Receiver<engine::Stopped>,
+    stop: Arc<Notify>,
+    _advert: Option<discovery::Advertisement>,
+) -> Result<()> {
+    let connector = tokio::spawn(connector::run(daemon.clone()));
     let mut ticks = tokio::time::interval(TICK);
     let mut revocations = tokio::time::interval(REVOKE_CHECK);
     let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
@@ -132,10 +206,7 @@ pub async fn run(
     let mut watching: Option<FolderWatcher> = None;
     let result = loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("Stopping.");
-                break Ok(());
-            }
+            () = stop.notified() => break Ok(()),
             stopped = &mut engine_done => {
                 let why = stopped.unwrap_or_else(|_| Err("its thread exited".into()));
                 break Err(anyhow!("sync engine stopped: {}", why.err().unwrap_or_default()));
@@ -160,6 +231,9 @@ pub async fn run(
                 refreshwatching(&daemon, &mut watched, &mut watching);
                 daemon.engine.send(Input::Tick);
             }
+            () = daemon.refresh.notified() => {
+                refreshwatching(&daemon, &mut watched, &mut watching);
+            }
             _ = revocations.tick() => {
                 let paired: Vec<DeviceId> = match daemon.store().peers() {
                     Ok(peers) => peers.into_iter().map(|p| p.device_id).collect(),
@@ -170,6 +244,7 @@ pub async fn run(
                 };
                 for peer in daemon.sessions.drop_unpaired(&paired, &daemon.engine) {
                     info!("closed the session with {}: it was unpaired", peer.short());
+                    daemon.emit(EventKind::StatusChanged);
                 }
             }
         }

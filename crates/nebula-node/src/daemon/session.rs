@@ -24,7 +24,8 @@ use tracing::{debug, info, warn};
 
 use super::Daemon;
 use super::engine::EngineHandle;
-use crate::run::{check_protocol, hello, is_closed, is_hangup};
+use crate::events::EventKind;
+use crate::net::{check_protocol, hello, is_closed, is_hangup};
 
 /// The peer must say hello within this long after the handshake.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -55,6 +56,9 @@ pub fn keep_new(existing_initiator: &DeviceId, new_initiator: &DeviceId) -> bool
 struct Live {
     id: u64,
     initiator: DeviceId,
+    /// Where the peer is, and the session's security code, for status.
+    addr: SocketAddr,
+    code: String,
     out: mpsc::Sender<Message>,
     /// Dropping this closes the session.
     _close: oneshot::Sender<()>,
@@ -120,6 +124,11 @@ impl Registry {
         self.lock().contains_key(peer)
     }
 
+    /// Address and security code of the live session with `peer`.
+    pub fn info(&self, peer: &DeviceId) -> Option<(SocketAddr, String)> {
+        self.lock().get(peer).map(|l| (l.addr, l.code.clone()))
+    }
+
     pub fn close_all(&self) {
         self.lock().clear();
     }
@@ -156,12 +165,15 @@ impl Registry {
         true
     }
 
-    fn unregister(&self, peer: DeviceId, id: u64, engine: &EngineHandle) {
+    /// Returns whether this session was the registered one.
+    fn unregister(&self, peer: DeviceId, id: u64, engine: &EngineHandle) -> bool {
         let mut map = self.lock();
         if map.get(&peer).is_some_and(|l| l.id == id) {
             map.remove(&peer);
             engine.send(Input::Disconnected { peer });
+            return true;
         }
+        false
     }
 }
 
@@ -183,6 +195,10 @@ pub async fn incoming(
                 "refused a connection from {addr}: device {} is not paired with this one",
                 device.short()
             );
+            d.emit(EventKind::Refused {
+                address: addr.ip().to_string(),
+                id: device.short(),
+            });
             return;
         }
         Err(TransportError::Io(e)) if is_closed(&e) => {
@@ -217,7 +233,7 @@ pub async fn run(
         peer.short(),
         session.security_code().to_string().to_uppercase()
     );
-    match drive(&d, session, initiator, &peer_name, &conn).await {
+    match drive(&d, session, addr, initiator, &peer_name, &conn).await {
         Ok(true) => info!("\"{peer_name}\" disconnected ({conn})"),
         Ok(false) => {}
         Err(e) => warn!("session with \"{peer_name}\" ended ({conn}): {e}"),
@@ -227,11 +243,13 @@ pub async fn run(
 async fn drive(
     d: &Daemon,
     session: Session<TcpStream>,
+    addr: SocketAddr,
     initiator: DeviceId,
     peer_name: &str,
     conn: &str,
 ) -> Result<bool> {
     let peer = session.remote_device();
+    let code = session.security_code().to_string().to_uppercase();
     let (mut tx, mut rx) = session.into_split();
     send(&mut tx, &hello(&d.name)).await?;
     let first = tokio::time::timeout(HELLO_TIMEOUT, recv(&mut rx))
@@ -246,6 +264,8 @@ async fn drive(
             let live = Live {
                 id,
                 initiator,
+                addr,
+                code: code.clone(),
                 out: out_tx.clone(),
                 _close: close_tx,
             };
@@ -253,6 +273,13 @@ async fn drive(
                 info!("already connected to \"{peer_name}\"; closing the duplicate {conn}");
                 return Ok(false);
             }
+            d.emit(EventKind::PeerOnline {
+                name: peer_name.to_string(),
+                id: peer.short(),
+                address: addr.to_string(),
+                security_code: code.clone(),
+            });
+            d.emit(EventKind::StatusChanged);
             (Some(close_rx), None)
         }
         // `nebula ping`: answered, never registered.
@@ -286,8 +313,12 @@ async fn drive(
             Ok(false)
         }
     };
-    if sync {
-        d.sessions.unregister(peer, id, &d.engine);
+    if sync && d.sessions.unregister(peer, id, &d.engine) {
+        d.emit(EventKind::PeerOffline {
+            name: peer_name.to_string(),
+            id: peer.short(),
+        });
+        d.emit(EventKind::StatusChanged);
     }
     res
 }
@@ -443,6 +474,8 @@ mod tests {
             Live {
                 id,
                 initiator,
+                addr: SocketAddr::from(([127, 0, 0, 1], 7878)),
+                code: String::new(),
                 out,
                 _close: close,
             },
