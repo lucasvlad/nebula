@@ -2,3 +2,4 @@
 .DS_Store
 .claude/worktrees/
 PAPER-GUIDE.pdf
+crates/nebula-app/gen/

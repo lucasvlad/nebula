@@ -1,1 +1,0 @@
-{"default":{"identifier":"default","description":"The main window may use Nebula's own commands, events, and the folder picker.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open"]}}
