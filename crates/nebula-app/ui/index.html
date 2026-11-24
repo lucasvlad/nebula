@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nebula</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231A2749'/%3E%3Cpath d='M9 16h14' stroke='%235D3FD3' stroke-width='3'/%3E%3Ccircle cx='8' cy='16' r='4' fill='%23E6E6E6'/%3E%3Ccircle cx='24' cy='16' r='4' fill='%232DE1C2'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <!-- Header: the link between this device and the other one(s). The whole band is the "no cloud" diagram. -->
+  <header class="band">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M9 16h14" stroke="currentColor" stroke-width="3"/><circle cx="8" cy="16" r="4.5" fill="#E6E6E6"/><circle cx="24" cy="16" r="4.5" fill="#2DE1C2"/></svg>
+      <span class="brand-name">Nebula</span>
+      <span class="mock-badge" id="mock-badge" hidden>Demo data (browser preview)</span>
+    </div>
+
+    <div class="link" id="link" data-state="idle">
+      <div class="device device-me">
+        <svg class="device-icon" viewBox="0 0 48 36" aria-hidden="true"><rect x="7" y="3" width="34" height="23" rx="2.5"/><path d="M2 30h44l-3 3H5z"/></svg>
+        <button class="me-name" id="me-name" type="button" title="Rename this device">
+          <span id="me-name-text">This device</span>
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M11 2.5l2.5 2.5L6 12.5H3.5V10z"/></svg>
+        </button>
+        <span class="device-sub" id="me-sub">This device</span>
+      </div>
+
+      <div class="middle">
+      <div class="wire" aria-hidden="true">
+        <div class="wire-line"><span class="pulse"></span><span class="pulse"></span><span class="pulse"></span></div>
+        <div class="no-cloud" title="No cloud server involved">
+          <svg viewBox="0 0 40 28"><path d="M11 23h19a7 7 0 0 0 .6-14A9.5 9.5 0 0 0 12.4 8 7.6 7.6 0 0 0 11 23z"/><path class="strike" d="M6 26L34 2"/></svg>
+        </div>
+      </div>
+      <p class="link-caption" id="link-caption">Nothing goes to the internet.</p>
+      </div>
+
+      <div class="device device-peer" id="peer-device">
+        <svg class="device-icon" viewBox="0 0 48 36" aria-hidden="true"><rect x="7" y="3" width="34" height="23" rx="2.5"/><path d="M2 30h44l-3 3H5z"/></svg>
+        <span class="peer-name" id="peer-name">No other device online</span>
+        <span class="device-sub" id="peer-sub">Waiting on this network</span>
+      </div>
+
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="side">
+      <section class="panel" aria-labelledby="devices-h">
+        <div class="panel-head">
+          <h2 id="devices-h">Your devices</h2>
+          <button class="btn btn-primary" id="pair-btn" type="button">Pair a device</button>
+        </div>
+        <ul class="peer-list" id="peer-list"></ul>
+      </section>
+
+      <section class="panel" aria-labelledby="folders-h">
+        <div class="panel-head">
+          <h2 id="folders-h">Synced folders</h2>
+          <button class="btn" id="add-folder-btn" type="button">Add folder</button>
+        </div>
+        <ul class="folder-list" id="folder-list"></ul>
+      </section>
+    </aside>
+
+    <section class="feed-wrap" aria-labelledby="feed-h">
+      <div class="feed-head">
+        <h2 id="feed-h"><span class="live-dot" aria-hidden="true"></span>Live activity</h2>
+        <p class="saved-total" id="saved-total" hidden></p>
+      </div>
+      <ol class="feed" id="feed" aria-live="polite"></ol>
+      <p class="feed-empty" id="feed-empty">Nothing has happened yet. Add a folder with the same name on both devices, and every change will show up here as it syncs.</p>
+    </section>
+  </main>
+
+  <!-- Pair dialog -->
+  <dialog class="dialog" id="pair-dialog" aria-labelledby="pair-title">
+    <div class="dialog-head">
+      <h2 id="pair-title">Pair a device</h2>
+      <button class="icon-btn" type="button" data-close aria-label="Close">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 3.5l9 9M12.5 3.5l-9 9"/></svg>
+      </button>
+    </div>
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" id="tab-show" aria-controls="pane-show" aria-selected="true">Show a code</button>
+      <button type="button" role="tab" id="tab-enter" aria-controls="pane-enter" aria-selected="false" tabindex="-1">Enter a code</button>
+    </div>
+
+    <div class="pane" id="pane-show" role="tabpanel" aria-labelledby="tab-show">
+      <div data-step="waiting">
+        <p class="pane-lead">On your other device, choose <strong>Enter a code</strong> and type:</p>
+        <p class="pair-code" id="pair-code" aria-live="polite">––– –––</p>
+        <div class="countdown"><div class="countdown-bar" id="countdown-bar"></div></div>
+        <p class="muted" id="countdown-text">Waiting for the other device…</p>
+      </div>
+      <div data-step="failed" hidden>
+        <p class="pane-error" id="show-error"></p>
+        <button class="btn btn-primary" type="button" id="show-retry">Show a new code</button>
+      </div>
+      <div data-step="done" hidden class="pair-done"></div>
+    </div>
+
+    <div class="pane" id="pane-enter" role="tabpanel" aria-labelledby="tab-enter" hidden>
+      <form id="join-form" data-step="form" novalidate>
+        <p class="pane-lead">On your other device, choose <strong>Show a code</strong>, then type it here.</p>
+        <label class="field">
+          <span>Pairing code</span>
+          <input id="join-code" class="code-input" inputmode="numeric" autocomplete="off" placeholder="123-456" maxlength="7" required>
+        </label>
+        <label class="field">
+          <span>Address <span class="muted">(only if the device isn’t found automatically)</span></span>
+          <input id="join-addr" autocomplete="off" spellcheck="false" placeholder="192.168.1.42:7878">
+        </label>
+        <p class="pane-error" id="join-error" hidden></p>
+        <button class="btn btn-primary" type="submit" id="join-submit">Pair</button>
+      </form>
+      <div data-step="done" hidden class="pair-done"></div>
+    </div>
+  </dialog>
+
+  <!-- Add folder: name step -->
+  <dialog class="dialog dialog-small" id="folder-dialog" aria-labelledby="folder-title">
+    <form method="dialog" id="folder-form">
+      <h2 id="folder-title">Name this folder</h2>
+      <p class="muted picked-path" id="folder-path"></p>
+      <label class="field">
+        <span>Name</span>
+        <input id="folder-label" autocomplete="off" required>
+      </label>
+      <p class="hint">Use the same name on your other device. That is how Nebula knows the two folders belong together.</p>
+      <div class="dialog-actions">
+        <button class="btn" type="button" data-close>Cancel</button>
+        <button class="btn btn-primary" type="submit">Start syncing</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Generic confirm -->
+  <dialog class="dialog dialog-small" id="confirm-dialog" aria-labelledby="confirm-title">
+    <form method="dialog">
+      <h2 id="confirm-title"></h2>
+      <p class="confirm-body" id="confirm-body"></p>
+      <div class="dialog-actions">
+        <button class="btn" value="cancel" type="submit">Cancel</button>
+        <button class="btn btn-danger" value="ok" type="submit" id="confirm-ok"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>
